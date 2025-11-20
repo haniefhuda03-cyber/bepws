@@ -1,0 +1,38 @@
+services:
+  tuws:
+    build: .
+    container_name: be_flask_tuws
+    depends_on:
+      - db
+    ports:
+      - "4046:5000"
+    networks:
+      - backend_tuws
+
+  db:
+    image: mysql:5.7
+    restart: always
+    container_name: db_mysql_tuws
+    environment:
+      MYSQL_DATABASE: tuws
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: adminTUWSPas
+      MYSQL_ROOT_PASSWORD: rootPasTUWS
+    ports:
+      - "3050:3306"
+    volumes:
+      - mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uadmin", "-pdbPasswordTUWS"]
+      timeout: 20s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend_tuws
+
+volumes:
+  mysql:
+
+networks:
+  backend_tuws:
+    driver: bridge

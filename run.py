@@ -5,7 +5,6 @@ import logging
 
 app = create_app()
 
-
 def _start_scheduler_and_jobs():
     from datetime import datetime
     try:
@@ -23,7 +22,6 @@ def _start_scheduler_and_jobs():
         logging.info("Scheduler dimulai dan job 'fetch-weather' didaftarkan (interval 5 menit, run segera saat startup).")
     except Exception as e:
         logging.warning(f"Gagal memulai scheduler atau menambah job: {e}")
-
 
 if __name__ == '__main__':
     debug = os.environ.get('FLASK_DEBUG', 'false').lower() in ('1', 'true', 'yes')

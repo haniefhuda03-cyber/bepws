@@ -11,7 +11,6 @@ from . import cache
 
 bp = Blueprint('api', __name__)
 
-
 def _to_wib_iso(dt):
     if not dt:
         return None
@@ -65,7 +64,6 @@ def data():
 
     t = request.args.get('type', 'general')
     source = request.args.get('source')
-    # default source
     if not source:
         source = 'ecowitt'
     source = source.lower()
@@ -80,7 +78,6 @@ def data():
         wu = pl.get('weather_wunderground')
         eco = pl.get('weather_ecowitt')
 
-        # latest PredictionLog and weather object for metadata & timestamps
         try:
             pl_db = db.session.query(models.PredictionLog).order_by(models.PredictionLog.created_at.desc()).first()
         except Exception:
@@ -92,7 +89,6 @@ def data():
         if pl_db:
             weather_obj = pl_db.weather_log_ecowitt if source == 'ecowitt' else pl_db.weather_log_wunderground
 
-        # build the field values from payload
         if source == 'ecowitt':
             temp = eco.get('temperature_main_outdoor') if eco else None
             humidity = eco.get('humidity_outdoor') if eco else None
@@ -139,83 +135,108 @@ def data():
         return jsonify({'ok': True, 'data': resp_data}), 200
 
     if t == 'hourly':
-        # --- 1. Logika Waktu & Reset Harian (WIB vs UTC) ---
-        # Definisikan Timezone WIB (UTC+7)
+        # Improved hourly logic per requirements:
+        # - optional `limit` param (1..12)
+        # - query from current hour floored (WIB) forward
+        # - pick earliest record per hour (rows ordered asc)
+        # - display target time = record_time_wib + 1 hour
         WIB = timezone(timedelta(hours=7))
-        
-        # Ambil waktu sekarang (UTC) dan konversi ke WIB
+
+        # Parse `limit` param
+        limit_param = request.args.get('limit')
+        limit = None
+        if limit_param is not None:
+            try:
+                limit = int(limit_param)
+            except Exception:
+                return jsonify({'ok': False, 'message': 'invalid limit'}), 400
+            if limit < 1 or limit > 12:
+                return jsonify({'ok': False, 'message': 'limit harus antara 1 dan 12'}), 400
+
+        # Current time in WIB and floored to hour
         now_utc = datetime.now(timezone.utc)
         now_wib = now_utc.astimezone(WIB)
-        
-        # Reset jam menjadi 00:00:00 WIB (Start of Day)
-        # Ini memastikan jika sekarang jam 00:05 WIB, data kemarin (jam 23:00 WIB) tidak diambil.
-        start_of_day_wib = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # Konversi balik Start of Day WIB ke UTC untuk query database
-        start_of_day_utc = start_of_day_wib.astimezone(timezone.utc)
+        start_of_current_hour_wib = now_wib.replace(minute=0, second=0, microsecond=0)
 
-        # --- 2. Query Database ---
-        # Ambil data mulai dari Start of Day UTC sampai sekarang
-        q = db.session.query(models.PredictionLog).filter(models.PredictionLog.created_at >= start_of_day_utc)
+        # Convert to UTC for DB query
+        start_dt_utc = start_of_current_hour_wib.astimezone(timezone.utc)
 
-        # Filter Source (Wunderground vs Ecowitt)
-        if source == 'ecowitt':
-            q = q.filter(models.PredictionLog.weather_log_ecowitt_id.isnot(None))
-        elif source == 'wunderground':
-            q = q.filter(models.PredictionLog.weather_log_wunderground_id.isnot(None))
-        
-        # Order ASCENDING (dari pagi ke malam) penting untuk logika downsampling
-        # agar kita mengambil menit pertama/awal di setiap jamnya.
+        q = db.session.query(models.PredictionLog).filter(models.PredictionLog.created_at >= start_dt_utc)
+
+        source_param_provided = 'source' in request.args
+        if source_param_provided:
+            if source == 'ecowitt':
+                q = q.filter(models.PredictionLog.weather_log_ecowitt_id.isnot(None))
+            elif source == 'wunderground':
+                q = q.filter(models.PredictionLog.weather_log_wunderground_id.isnot(None))
+
         rows = q.order_by(models.PredictionLog.created_at.asc()).all()
 
-        # --- 3. Downsampling & Formatting (Python Processing) ---
         seen_hours = set()
         hours = []
 
         for pl in rows:
             if not pl or not pl.created_at:
                 continue
-            
-            # Pastikan datetime aware UTC
+
             created = pl.created_at
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
-            
-            # Konversi ke WIB untuk pengecekan jam
-            created_wib = created.astimezone(WIB)
-            
-            # Ambil jam (0-23)
-            hour_key = created_wib.hour
 
-            # LOGIKA UTAMA: Skip jika jam ini sudah ada datanya
+            created_wib = created.astimezone(WIB)
+
+            # Use date+hour key to avoid collisions across days
+            hour_key = created_wib.strftime('%Y-%m-%d %H')
+
             if hour_key in seen_hours:
                 continue
-            
-            # Tandai jam ini sudah diambil
+
+            # keep earliest record for this hour (rows ordered asc)
             seen_hours.add(hour_key)
 
-            # Format Data Output
-            date_str = created_wib.strftime('%Y-%m-%d') # YYYY-MM-DD (WIB)
-            time_str = created_wib.strftime('%H:%M')    # HH:MM (WIB)
+            # prediction target (display) = record_time + 1 hour
+            display_time = created_wib + timedelta(hours=1)
 
-            # Ekstraksi Data Berdasarkan Source
+            # Only include future prediction targets
+            if display_time <= now_wib:
+                continue
+
+            date_str = display_time.strftime('%Y-%m-%d')
+            time_str = display_time.strftime('%H:%M')
+
             temp = None
             weather_predict = None
 
-            if source == 'ecowitt':
-                wl = pl.weather_log_ecowitt
-                label = pl.ecowitt_label
-                if wl:
-                    temp = wl.temperature_main_outdoor
-                if label:
-                    weather_predict = label.name
-            else: # wunderground
-                wl = pl.weather_log_wunderground
-                label = pl.wunderground_label
-                if wl:
-                    temp = wl.temperature
-                if label:
-                    weather_predict = label.name
+            if source_param_provided:
+                if source == 'ecowitt':
+                    wl = pl.weather_log_ecowitt
+                    label = pl.ecowitt_label
+                    if wl:
+                        temp = wl.temperature_main_outdoor
+                    if label:
+                        weather_predict = label.name
+                else:
+                    wl = pl.weather_log_wunderground
+                    label = pl.wunderground_label
+                    if wl:
+                        temp = wl.temperature
+                    if label:
+                        weather_predict = label.name
+            else:
+                if getattr(pl, 'weather_log_ecowitt', None):
+                    wl = pl.weather_log_ecowitt
+                    label = pl.ecowitt_label
+                    if wl:
+                        temp = wl.temperature_main_outdoor
+                    if label:
+                        weather_predict = label.name
+                else:
+                    wl = pl.weather_log_wunderground
+                    label = pl.wunderground_label
+                    if wl:
+                        temp = wl.temperature
+                    if label:
+                        weather_predict = label.name
 
             hours.append({
                 'id': pl.id,
@@ -225,11 +246,15 @@ def data():
                 'weather_predict': weather_predict,
             })
 
-        # --- 4. Output JSON ---
+            if limit is not None and len(hours) >= limit:
+                break
+
+        if source_param_provided:
+            key = 'weather_ecowitt' if source == 'ecowitt' else 'weather_wunderground'
+            return jsonify({'ok': True, 'hours': {key: hours}}), 200
         return jsonify({'ok': True, 'hours': hours}), 200
 
     if t == 'details':
-        # Validate allowed query params for details endpoint
         allowed = {'type', 'id', 'source', 'api_key'}
         unknown = set(request.args.keys()) - allowed
         if unknown:
@@ -237,7 +262,6 @@ def data():
 
         pid = request.args.get('id')
 
-        # Build base query. If client explicitly provided source, require matching weather log.
         base_q = db.session.query(models.PredictionLog)
         if 'source' in request.args:
             if source == 'ecowitt':
@@ -245,7 +269,6 @@ def data():
             else:
                 base_q = base_q.filter(models.PredictionLog.weather_log_wunderground_id.isnot(None))
         else:
-            # prefer any prediction that has at least one weather log
             base_q = base_q.filter(
                 or_(
                     models.PredictionLog.weather_log_ecowitt_id.isnot(None),
@@ -262,12 +285,10 @@ def data():
             if not pl:
                 return jsonify({'ok': False, 'message': 'Not found'}), 404
         else:
-            # pick latest matching prediction
             pl = base_q.order_by(models.PredictionLog.created_at.desc()).first()
             if not pl:
                 return jsonify({'ok': False, 'message': 'No data found'}), 404
 
-        # Choose the weather log object to extract fields from
         if 'source' in request.args:
             if source == 'ecowitt':
                 wl = pl.weather_log_ecowitt
@@ -276,7 +297,6 @@ def data():
                 wl = pl.weather_log_wunderground
                 key = 'weather_wunderground'
         else:
-            # if client didn't state source, prefer ecowitt, otherwise wunderground
             if getattr(pl, 'weather_log_ecowitt', None):
                 wl = pl.weather_log_ecowitt
                 key = 'weather_ecowitt'
@@ -284,7 +304,6 @@ def data():
                 wl = pl.weather_log_wunderground
                 key = 'weather_wunderground'
 
-        # Build response payload fields (always include id and translated time)
         time_wib = _to_wib_iso(getattr(pl, 'created_at', None))
         if key == 'weather_ecowitt':
             data_obj = {
@@ -311,7 +330,6 @@ def data():
                 'pressure_relative': getattr(wl, 'pressure', None) if wl else None,
             }
 
-        # Wrap when source was explicitly provided; otherwise return flat data object
         if 'source' in request.args:
             resp = {'ok': True, 'data': {key: data_obj}}
         else:
@@ -324,7 +342,6 @@ def data():
 
 @bp.route('/history', methods=['GET'])
 def get_history():
-    """History endpoint with flexible WIB-based date/time filtering."""
     
     ok, rest = _require_api_key()
     if not ok: return rest[0]
@@ -333,22 +350,19 @@ def get_history():
     except: return jsonify({'ok': False, 'message': 'invalid page'}), 400
     if page < 1: page = 1
 
-    # If client provided source, validate it. If not provided, we'll prefer ecowitt when present.
     source_arg = request.args.get('source')
     if source_arg:
         source = source_arg.lower()
         if source not in ('ecowitt', 'wunderground'):
             return jsonify({'ok': False, 'message': "invalid source"}), 400
     else:
-        source = None
+        source = 'ecowitt'
 
     per_page = 5
     offset = (page - 1) * per_page
 
-    # Constant untuk WIB (UTC+7)
     WIB_TZ = timezone(timedelta(hours=7))
 
-    # Helper parsing
     def _parse_date(s):
         try: return datetime.strptime(s, '%Y-%m-%d').date()
         except: return None
@@ -359,14 +373,12 @@ def get_history():
             try: return datetime.strptime(s, '%H:%M:%S').time()
             except: return None
 
-    # Konversi Time WIB -> UTC (Aritmatika)
     def _wib_time_to_utc_time(t_obj):
         if t_obj is None: return None
         wib_seconds = t_obj.hour * 3600 + t_obj.minute * 60 + t_obj.second
         utc_seconds = (wib_seconds - 25200) % 86400
         return (datetime.min + timedelta(seconds=utc_seconds)).time()
 
-    # Ambil parameter
     date_str = request.args.get('date')
     time_str = request.args.get('time')
     start_date_str = request.args.get('start_date')
@@ -385,15 +397,11 @@ def get_history():
     use_date_range = False
     use_time_filter = False
 
-    # --- VALIDASI KELENGKAPAN PASANGAN ---
     if (start_date_str and not end_date_str) or (not start_date_str and end_date_str):
         return jsonify({'ok': False, 'message': 'Harap sertakan start_date DAN end_date.'}), 400
     if (start_time_str and not end_time_str) or (not start_time_str and end_time_str):
         return jsonify({'ok': False, 'message': 'Harap sertakan start_time DAN end_time.'}), 400
 
-    # ==================================================
-    # TAHAP 1: SET FILTER TANGGAL (KALENDER)
-    # ==================================================
     if date_str:
         d = _parse_date(date_str)
         if not d: return jsonify({'ok': False, 'message': 'Format date salah'}), 400
@@ -418,50 +426,38 @@ def get_history():
         filter_date_end_utc = dt_end.astimezone(timezone.utc)
         use_date_range = True
 
-    # ==================================================
-    # TAHAP 2: SET FILTER JAM (CLOCK)
-    # ==================================================
     if time_str:
         t = _parse_time(time_str)
         if not t: return jsonify({'ok': False, 'message': 'Format time salah'}), 400
         
         if use_date_range and date_str:
-             # Case Khusus: Date + Time = Point Spesifik
-             d = _parse_date(date_str)
-             spec_dt = datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=WIB_TZ)
-             spec_utc = spec_dt.astimezone(timezone.utc)
+            d = _parse_date(date_str)
+            spec_dt = datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=WIB_TZ)
+            spec_utc = spec_dt.astimezone(timezone.utc)
              
-             filter_date_start_utc = spec_utc
-             filter_date_end_utc = spec_utc 
-             use_time_filter = False 
+            filter_date_start_utc = spec_utc
+            filter_date_end_utc = spec_utc 
+            use_time_filter = False 
         else:
-             # Time Only (Recurring)
-             utc_t = _wib_time_to_utc_time(t)
-             filter_time_start_utc = utc_t
-             filter_time_end_utc = utc_t 
-             use_time_filter = True
+            utc_t = _wib_time_to_utc_time(t)
+            filter_time_start_utc = utc_t
+            filter_time_end_utc = utc_t 
+            use_time_filter = True
 
     elif start_time_str and end_time_str:
         st = _parse_time(start_time_str)
         et = _parse_time(end_time_str)
         if not st or not et: return jsonify({'ok': False, 'message': 'Format start/end_time salah'}), 400
         
-        # [MODIFIKASI KHUSUS]
-        # Jika 'date' (Single Day) diset, MAKA start_time TIDAK BOLEH > end_time
-        # (Tidak bisa nyebrang hari dalam satu tanggal kalender yang sama)
         if date_str and st > et:
             return jsonify({'ok': False, 'message': 'start_time harus <= end_time jika menggunakan parameter date (satu hari)'}), 400
-
-        # Jika date_str kosong (Recurring) atau Range Date, maka Cross Midnight (st > et) DIIZINKAN.
 
         filter_time_start_utc = _wib_time_to_utc_time(st)
         filter_time_end_utc = _wib_time_to_utc_time(et)
         use_time_filter = True
 
-    # --- EKSEKUSI QUERY ---
     base_q = db.session.query(models.PredictionLog)
 
-    # If client explicitly asked a source, restrict to that source. Otherwise include both
     if source == 'ecowitt':
         base_q = base_q.filter(models.PredictionLog.weather_log_ecowitt_id.isnot(None))
     elif source == 'wunderground':
@@ -474,7 +470,6 @@ def get_history():
             )
         )
 
-    # 1. Terapkan Filter Tanggal
     if use_date_range:
         if filter_date_start_utc == filter_date_end_utc:
              base_q = base_q.filter(models.PredictionLog.created_at == filter_date_start_utc)
@@ -484,20 +479,15 @@ def get_history():
                  models.PredictionLog.created_at <= filter_date_end_utc
              )
 
-    # 2. Terapkan Filter Jam
     if use_time_filter:
         db_time = func.time(models.PredictionLog.created_at)
         
         if filter_time_start_utc == filter_time_end_utc:
             base_q = base_q.filter(db_time == filter_time_start_utc)
         else:
-            # Cek Logic UTC: Normal vs Nyebrang
             if filter_time_start_utc <= filter_time_end_utc:
-                # Range Normal
                 base_q = base_q.filter(db_time.between(filter_time_start_utc, filter_time_end_utc))
             else:
-                # Range Cross Midnight (UTC)
-                # Logic ini berjalan jika input 'start_time > end_time' diizinkan (no single date)
                 base_q = base_q.filter(
                     or_(db_time >= filter_time_start_utc, db_time <= filter_time_end_utc)
                 )
@@ -511,18 +501,15 @@ def get_history():
         .all()
     )
 
-    # Build response
     data_list = []
     source_param_provided = 'source' in request.args
 
     for p in pls:
-        # Choose weather log per-record. If client specified source, honor it.
         if source == 'ecowitt':
             wl = p.weather_log_ecowitt
         elif source == 'wunderground':
             wl = p.weather_log_wunderground
         else:
-            # prefer ecowitt when present, otherwise use wunderground
             wl = p.weather_log_ecowitt if getattr(p, 'weather_log_ecowitt', None) else p.weather_log_wunderground
         time_wib = _to_wib_iso(getattr(p, 'created_at', None))
 
@@ -575,107 +562,6 @@ def get_history():
     resp = {'ok': True, 'page': page, 'per_page': per_page, 'total': total, 'data': data_list}
     return jsonify(resp), 200
 
-
-@bp.route('/graph', methods=['GET'])
-def graph():
-    ok, rest = _require_api_key()
-    if not ok:
-        return rest[0]
-    # Aturan utama: default = ecowitt
-    source = request.args.get('source') or 'ecowitt'
-    source = source.lower()
-    if source not in ('ecowitt', 'wunderground'):
-        return jsonify({'ok': False, 'message': "invalid source; gunakan 'ecowitt' atau 'wunderground'"}), 400
-
-    metric = request.args.get('metric')
-    if not metric:
-        return jsonify({'ok': False, 'message': 'metric param required'}), 400
-
-    range_param = request.args.get('range')
-    if not range_param:
-        return jsonify({'ok': False, 'message': 'range param required (harian|pekanan)'}), 400
-    rp = range_param.lower()
-    if rp in ('harian', 'daily'):
-        days = 1
-    elif rp in ('pekanan', 'mingguan', 'weekly'):
-        days = 7
-    else:
-        return jsonify({'ok': False, 'message': "range harus 'harian' atau 'pekanan'"}), 400
-
-    # map metric strings to columns per source
-    metric_key = metric.lower()
-    if source == 'ecowitt':
-        mapping = {
-            'suhu': 'temperature_main_outdoor',
-            'temperature': 'temperature_main_outdoor',
-            'tekanan_udara_relatif': 'pressure_relative',
-            'kelembapan': 'humidity_outdoor',
-            'kecepatan_angin': 'wind_speed',
-            'uvi': 'uvi',
-            'curah_hujan': 'rain_rate',
-            'radiasi_matahari': 'solar_irradiance',
-        }
-        table = models.WeatherLogEcowitt
-    else:
-        mapping = {
-            'suhu': 'temperature',
-            'temperature': 'temperature',
-            'tekanan_udara_relatif': 'pressure',
-            'kelembapan': 'humidity',
-            'kecepatan_angin': 'wind_speed',
-            'uvi': 'ultraviolet_radiation',
-            'curah_hujan': 'precipitation_rate',
-            'radiasi_matahari': 'solar_radiation',
-        }
-        table = models.WeatherLogWunderground
-
-    col_name = mapping.get(metric_key)
-    if not col_name:
-        return jsonify({'ok': False, 'message': f"unknown metric '{metric}' for source {source}"}), 400
-
-    col = getattr(table, col_name)
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=days)
-
-    q = db.session.query(func.max(col), func.min(col), func.avg(col)).filter(table.created_at >= start, table.created_at <= now)
-    max_v, min_v, avg_v = q.first() or (None, None, None)
-
-    # nilai asli: average of the previous period (day/week before)
-    prev_start = start - timedelta(days=days)
-    prev_end = start
-    prev_avg = db.session.query(func.avg(col)).filter(table.created_at >= prev_start, table.created_at < prev_end).scalar()
-
-    def _maybe_float(x):
-        try:
-            return float(x) if x is not None else None
-        except Exception:
-            return None
-
-    # attach metric and latest times (from DB) for context
-    latest_pl = (
-        db.session.query(models.PredictionLog)
-        .order_by(models.PredictionLog.created_at.desc())
-        .first()
-    )
-    latest_weather = None
-    if latest_pl:
-        latest_weather = latest_pl.weather_log_ecowitt if source == 'ecowitt' else latest_pl.weather_log_wunderground
-
-    resp = {
-        'metric': metric,
-        'tertinggi': _maybe_float(max_v),
-        'terendah': _maybe_float(min_v),
-        'rata_rata': _maybe_float(avg_v),
-        'nilaiasli': _maybe_float(prev_avg),
-        'meta': {
-            'latest_prediction_id': latest_pl.id if latest_pl else None,
-            'created_at': _to_wib_iso(getattr(latest_pl, 'created_at', None)) if latest_pl else None,
-            'request_time': _to_wib_iso(getattr(latest_weather, 'request_time', None)) if latest_weather else None,
-        }
-    }
-    return jsonify(resp), 200
-
-
 @bp.route('/health', methods=['GET'])
 def health():
     ok = True
@@ -713,3 +599,20 @@ def health():
 
     status = 200 if ok else 500
     return jsonify({'ok': ok, 'details': details}), status
+
+
+@bp.route('/graph', methods=['GET'])
+def graph():
+    ok, rest = _require_api_key()
+    if not ok:
+        return rest[0]
+
+    range_param = request.args.get('range')
+    month = request.args.get('month')
+    source = request.args.get('source')
+    datatype = request.args.get('datatype')
+
+    payload = serializers.get_graph_payload(range_param, month=month, source=source, datatype=datatype)
+    if not payload.get('ok'):
+        return jsonify(payload), 400
+    return jsonify(payload), 200

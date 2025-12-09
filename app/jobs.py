@@ -12,18 +12,36 @@ from .models import (
     Model as ModelMeta,
 )
 from .ml_model import run_prediction, LABEL_MAP
+from .ml_lstm import run_parallel_lstm_predictions
 from .secrets import get_secret
 from concurrent.futures import ThreadPoolExecutor
 import random
 from flask import current_app
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
-
-
 from dotenv import load_dotenv
 from .set_variables import *
 
+def _mask_secret(val: str) -> str:
+    if not val:
+        return None
+    s = str(val)
+    if len(s) <= 6:
+        return '***'
+    return f"{s[:3]}...{s[-3:]}"
 
-logging.error(f'[ECO] ====== APP_KEY: {ECO_APP_KEY} | API_KEY: {ECO_API_KEY} | ECO_MAC: {ECO_MAC} | DATABASE_URL: {DATABASE_URL}')
+try:
+    masked_app = _mask_secret(globals().get('ECO_APP_KEY'))
+    masked_api = _mask_secret(globals().get('ECO_API_KEY'))
+    masked_mac = _mask_secret(globals().get('ECO_MAC'))
+    db_url = globals().get('DATABASE_URL')
+    db_host = None
+    if db_url and '@' in str(db_url):
+        db_host = str(db_url).split('@', 1)[1]
+    else:
+        db_host = str(db_url) if db_url else None
+    logging.info(f'[ECO] APP_KEY={masked_app} | API_KEY={masked_api} | ECO_MAC={masked_mac} | DATABASE={db_host}')
+except Exception:
+    logging.debug('ECO env vars present but masked for safety')
 
 if not WUNDERGROUND_URL:
     logging.warning('WUNDERGROUND_URL belum diset melalui environment atau secrets. Pengambilan data Wunderground akan dilewati sampai variabel ini diset.')
@@ -34,7 +52,6 @@ ECO_MAC = os.environ.get("ECO_MAC")
 if not any([ECO_APP_KEY, ECO_API_KEY, ECO_MAC]):
     logging.warning('Kredensial Ecowitt belum diset melalui environment atau secrets. fetch_ecowitt mungkin gagal atau mengembalikan None.')
 ECO_BASE = "https://api.ecowitt.net/api/v3"
-
 
 def _requests_get_with_retry(url, params=None, timeout=15):
     @retry(
@@ -80,22 +97,19 @@ def fetch_wunderground() -> Optional[WeatherLogWunderground]:
         return None
     
     obs = data["observations"][0]
-    metric = obs.get("metric", {})
-
-    wind_speed_kmh = metric.get("windSpeed")
-    wind_gust_kmh = metric.get("windGust")
+    metric_si = obs.get("metric_si", {})
 
     wl = WeatherLogWunderground(
         solar_radiation=obs.get("solarRadiation"),
         ultraviolet_radiation=obs.get("uv"),
         humidity=obs.get("humidity"),
-        temperature=metric.get("temp"),
-        pressure=metric.get("pressure"),
+        temperature=metric_si.get("temp"),
+        pressure=metric_si.get("pressure"),
         wind_direction=obs.get("winddir"),
-        wind_speed=wind_speed_kmh,
-        wind_gust=wind_gust_kmh,
-        precipitation_rate=metric.get("precipRate"),
-        precipitation_total=metric.get("precipTotal"),
+        wind_speed=metric_si.get("windSpeed"),
+        wind_gust=metric_si.get("windGust"),
+        precipitation_rate=metric_si.get("precipRate"),
+        precipitation_total=metric_si.get("precipTotal"),
         request_time=datetime.now(timezone.utc),
     )
     db.session.add(wl)
@@ -120,7 +134,7 @@ def fetch_ecowitt() -> Optional[WeatherLogEcowitt]:
         "pressure_unitid": 3,
         "wind_speed_unitid": 6,
         "rainfall_unitid": 12,
-        "solar_irradiance_unitid": 16,
+        "solar_irradiance_unitid": 14,
     }
     url = f"{ECO_BASE}/device/real_time"
 
@@ -238,11 +252,10 @@ def fetch_and_store_weather():
 
         prediction_tasks = {}
         if wu_log:
-            wu_wind_speed_ms = (float(wu_log.wind_speed) / 3.6) if wu_log.wind_speed is not None else None
             features_wu = {
                 'suhu': float(wu_log.temperature) if wu_log.temperature is not None else None,
                 'kelembaban': float(wu_log.humidity) if wu_log.humidity is not None else None,
-                'kecepatan_angin': wu_wind_speed_ms,
+                'kecepatan_angin': float(wu_log.wind_speed) if wu_log.wind_speed is not None else None,
                 'arah_angin': float(wu_log.wind_direction) if wu_log.wind_direction is not None else None,
                 'tekanan_udara': float(wu_log.pressure) if wu_log.pressure is not None else None,
                 'intensitas_hujan': float(wu_log.precipitation_rate) if wu_log.precipitation_rate is not None else 0.0,
@@ -286,4 +299,12 @@ def fetch_and_store_weather():
                 except Exception as e:
                     logging.error(f"Prediksi gagal untuk {source}: {e}")
         db.session.commit()
+
+        # Jalankan prediksi LSTM secara paralel untuk kedua sumber (tidak disimpan ke DB)
+        try:
+            lstm_results = run_parallel_lstm_predictions()
+            logging.info(f"LSTM Prediksi hasil (tidak disimpan ke DB): {lstm_results}")
+        except Exception as e:
+            logging.error(f"Gagal menjalankan prediksi LSTM: {e}")
+
         logging.info(f"[{datetime.now(timezone.utc)}] PredictionLog diperbarui dengan hasil (ID: {pl.id}). Pipeline selesai.")

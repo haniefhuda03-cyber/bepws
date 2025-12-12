@@ -1,335 +1,253 @@
 import os
-import time
 import math
 import logging
+import threading
+import numpy as np
+import pandas as pd  # Disarankan menggunakan Pandas untuk imputation
 from datetime import timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
-import numpy as np
-import pandas as pd
-
+# Flask & DB Imports
+from flask import current_app
 from . import db
 from .models import WeatherLogEcowitt, WeatherLogWunderground
-from flask import current_app
 
+# ML Imports (Safe Import)
 try:
     import joblib
-except Exception:
-    joblib = None
-
-try:
-    from sklearn.preprocessing import MinMaxScaler
-except Exception:
-    MinMaxScaler = None
-
-try:
     import tensorflow as tf
-except Exception:
+except ImportError:
+    joblib = None
     tf = None
 
-# --- Konfigurasi path model & scaler ---
+# --- KONFIGURASI PATH ---
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 MODEL_PATH = os.path.join(BASE_DIR, 'ml_models', 'model_lstm_regresi_telkom.keras')
 SCALER_PATH = os.path.join(BASE_DIR, 'ml_models', 'scalerFIT_split.joblib')
 
-# caching model dan scaler
-_cached_model = None
-_model_loaded_at = 0.0
-_model_reload_interval = 300.0  # 5 menit
-_cached_scaler = None
+# --- KONSTANTA MODEL ---
+SEQUENCE_LENGTH = 144       # Input: 144 timestep ke belakang
+PREDICTION_STEPS = 24       # Output: 24 timestep ke depan
+N_FEATURES = 9              # Jumlah fitur sesuai scaler
+WM2_TO_LUX = 126.7          # Konversi estimasi radiasi matahari ke lux
+RAIN_FEATURE_INDEX = 5      # Index kolom 'intensitas_hujan' pada scaler (urutan ke-6)
 
-# constants untuk fitur
-SEQUENCE_LENGTH = 144
-N_FEATURES = 9
-
-# conversion factor W/m2 -> lux (perkiraan). Digunakan hanya untuk Wunderground sesuai instruksi.
-# Faktor ini adalah nilai perkiraan; nilai sebenarnya bergantung spektrum cahaya.
-WM2_TO_LUX = 126.7
-
-# --- Loss custom (harus persis seperti yang diberikan) ---
-RAIN_EVENT_WEIGHT = 10.0
-NO_RAIN_WEIGHT = 1.0
-
+# --- CUSTOM LOSS FUNCTION ---
+# Wajib ada agar model Keras bisa di-load dengan benar
+@tf.keras.utils.register_keras_serializable()
 def weighted_masked_regression_loss(y_true, y_pred):
+    if tf is None: return 0.0
+    RAIN_EVENT_WEIGHT = 10.0
+    NO_RAIN_WEIGHT = 1.0
     squared_error = tf.square(y_true - y_pred)
     is_raining_mask = tf.cast(tf.greater(y_true, 0), tf.float32)
     weight = (is_raining_mask * (RAIN_EVENT_WEIGHT - NO_RAIN_WEIGHT) + NO_RAIN_WEIGHT)
     weighted_square_error = squared_error * weight
     return tf.reduce_mean(weighted_square_error)
 
-
-def _load_scaler() -> Optional[Any]:
-    global _cached_scaler
-    if _cached_scaler is not None:
-        return _cached_scaler
-    if joblib is None:
-        logging.warning('joblib tidak tersedia; scaler tidak dimuat')
-        return None
-    try:
-        if os.path.exists(SCALER_PATH):
-            _cached_scaler = joblib.load(SCALER_PATH)
-            logging.info(f'Scaler dimuat dari {SCALER_PATH}')
-            # pastikan scaler adalah MinMaxScaler jika memungkinkan
-            if MinMaxScaler is not None:
-                try:
-                    if not isinstance(_cached_scaler, MinMaxScaler):
-                        logging.warning('Scaler ter-load bukan MinMaxScaler. Akan menggunakan MinMaxScaler saat preprocessing sebagai fallback.')
-                except Exception:
-                    logging.debug('Tidak bisa memeriksa instance scaler dengan MinMaxScaler')
-        else:
-            logging.warning(f'Scaler tidak ditemukan di {SCALER_PATH}')
-            _cached_scaler = None
-    except Exception as e:
-        logging.error(f'Gagal memuat scaler: {e}')
-        _cached_scaler = None
-    return _cached_scaler
-
-
-def _load_model_if_needed() -> Optional[Any]:
-    """Muat model jika belum ada atau sudah lebih lama dari interval reload.
-    Mengembalikan objek model TensorFlow atau None jika gagal.
+class WeatherPredictor:
     """
-    global _cached_model, _model_loaded_at
-    now = time.time()
-    if _cached_model is not None and (now - _model_loaded_at) < _model_reload_interval:
-        return _cached_model
-
-    if tf is None:
-        logging.error('TensorFlow tidak tersedia, model LSTM tidak dapat dimuat')
-        return None
-
-    try:
-        if os.path.exists(MODEL_PATH):
-            model = tf.keras.models.load_model(MODEL_PATH, custom_objects={'weighted_masked_regression_loss': weighted_masked_regression_loss})
-            _cached_model = model
-            _model_loaded_at = now
-            logging.info(f'Model LSTM dimuat dari {MODEL_PATH} pada {time.ctime(now)}')
-            return _cached_model
-        else:
-            logging.error(f'File model tidak ditemukan di {MODEL_PATH}')
-            return None
-    except Exception as e:
-        logging.error(f'Gagal memuat model LSTM: {e}')
-        return None
-
-
-def _row_to_features_wunderground(row) -> Optional[List[float]]:
-    """Konversi satu baris WeatherLogWunderground menjadi vektor fitur 9 elemen.
-    Perhatikan: konversi W/m2 -> lux hanya untuk sumber Wunderground (kolom solar_radiation).
+    Singleton Class Thread-Safe untuk mengelola Model ML dan Scaler.
+    Memuat model dan scaler hanya sekali untuk efisiensi memori.
     """
-    try:
-        suhu = float(row.temperature) if row.temperature is not None else None
-        kelembaban = float(row.humidity) if row.humidity is not None else None
-        kecepatan_angin = float(row.wind_speed) if row.wind_speed is not None else None
-        arah_angin = float(row.wind_direction) if row.wind_direction is not None else None
-        tekanan = float(row.pressure) if row.pressure is not None else None
-        intensitas_hujan = float(row.precipitation_rate) if row.precipitation_rate is not None else 0.0
-        # solar_radiation pada Wunderground diasumsikan W/m2 -> konversi ke lux
-        solar_wm2 = float(row.solar_radiation) if row.solar_radiation is not None else 0.0
-        intensitas_cahaya = solar_wm2 * WM2_TO_LUX
+    _instance = None
+    _lock = threading.Lock() # Lock untuk mencegah race condition saat init
+    model = None
+    scaler = None
+    
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super(WeatherPredictor, cls).__new__(cls)
+                cls._instance._load_resources()
+        return cls._instance
 
-        # hour sin/cos dari request_time (convert ke WIB)
-        rt = row.request_time
-        if rt is None:
-            return None
-        if rt.tzinfo is None:
-            rt = rt.replace(tzinfo=timezone.utc)
-        wib = rt.astimezone(timezone(timedelta(hours=7)))
-        hour_decimal = wib.hour + wib.minute / 60.0 + wib.second / 3600.0
-        angle = 2.0 * math.pi * (hour_decimal / 24.0)
-        hour_sin = math.sin(angle)
-        hour_cos = math.cos(angle)
+    def _load_resources(self):
+        """Memuat model dan scaler ke memori."""
+        if not tf or not joblib:
+            logging.error("Library TensorFlow atau Joblib tidak terinstall atau hilang.")
+            return
 
-        return [suhu, kelembaban, kecepatan_angin, arah_angin, tekanan, intensitas_hujan, intensitas_cahaya, hour_sin, hour_cos]
-    except Exception:
-        return None
-
-
-def _row_to_features_ecowitt(row) -> Optional[List[float]]:
-    """Konversi satu baris WeatherLogEcowitt menjadi vektor fitur 9 elemen.
-    Catatan: instruksi menyebutkan Ecowitt sudah dalam Lux untuk solar_irradiance.
-    Untuk tekanan gunakan pressure_relative; untuk intensitas_hujan gunakan rain_rate.
-    """
-    try:
-        suhu = float(row.temperature_main_outdoor) if row.temperature_main_outdoor is not None else None
-        kelembaban = float(row.humidity_outdoor) if row.humidity_outdoor is not None else None
-        kecepatan_angin = float(row.wind_speed) if row.wind_speed is not None else None
-        arah_angin = float(row.wind_direction) if row.wind_direction is not None else None
-        tekanan = float(row.pressure_relative) if row.pressure_relative is not None else None
-        intensitas_hujan = float(row.rain_rate) if row.rain_rate is not None else 0.0
-        intensitas_cahaya = float(row.solar_irradiance) if row.solar_irradiance is not None else 0.0
-
-        rt = row.request_time
-        if rt is None:
-            return None
-        if rt.tzinfo is None:
-            rt = rt.replace(tzinfo=timezone.utc)
-        wib = rt.astimezone(timezone(timedelta(hours=7)))
-        hour_decimal = wib.hour + wib.minute / 60.0 + wib.second / 3600.0
-        angle = 2.0 * math.pi * (hour_decimal / 24.0)
-        hour_sin = math.sin(angle)
-        hour_cos = math.cos(angle)
-
-        return [suhu, kelembaban, kecepatan_angin, arah_angin, tekanan, intensitas_hujan, intensitas_cahaya, hour_sin, hour_cos]
-    except Exception:
-        return None
-
-
-def _fetch_last_n_rows(model_name: str, n: int = SEQUENCE_LENGTH, app=None) -> Optional[List[Any]]:
-    """Ambil n record terakhir (ordered by created_at desc) dari DB untuk source yang diberikan.
-    model_name: 'ecowitt' atau 'wunderground'
-    Mengembalikan list objek SQLAlchemy (dengan urutan kronologis ASC).
-    Jika dipanggil dari thread worker, terima parameter `app` dan gunakan `app.app_context()`.
-    """
-    try:
-        # Ensure we have an application context when querying from threads
-        if app is None:
-            try:
-                app = current_app._get_current_object()
-            except Exception:
-                logging.error(f'No application context available for fetching {model_name} rows from DB.')
-                return None
-
-        with app.app_context():
-            if model_name == 'ecowitt':
-                q = db.session.query(WeatherLogEcowitt).order_by(WeatherLogEcowitt.created_at.desc()).limit(n).all()
-            else:
-                q = db.session.query(WeatherLogWunderground).order_by(WeatherLogWunderground.created_at.desc()).limit(n).all()
-            if not q or len(q) < n:
-                return None
-            # q is DESC, reverse to get ASC chronologis
-            q.reverse()
-            return q
-    except Exception as e:
-        logging.error(f'Gagal mengambil data {model_name} dari DB: {e}')
-        return None
-
-
-def _prepare_sequence_from_rows(rows: List[Any], source: str) -> Optional[np.ndarray]:
-    """Bangun array shape (144, 9) dari rows menurut source.
-    Lakukan scaling menggunakan scaler yang dimuat.
-    """
-    features = []
-    if source == 'ecowitt':
-        for r in rows:
-            fv = _row_to_features_ecowitt(r)
-            if fv is None:
-                return None
-            features.append(fv)
-    else:
-        for r in rows:
-            fv = _row_to_features_wunderground(r)
-            if fv is None:
-                return None
-            features.append(fv)
-
-    arr = np.array(features, dtype=float)  # shape (144,9)
-    if arr.shape != (SEQUENCE_LENGTH, N_FEATURES):
-        return None
-
-    scaler = _load_scaler()
-    # Jika scaler yang dimuat adalah MinMaxScaler, gunakan langsung.
-    if scaler is not None:
+        # 1. Load Scaler
         try:
-            from sklearn.preprocessing import MinMaxScaler as _MMS
-            if _MMS is not None and isinstance(scaler, _MMS):
-                arr_scaled = scaler.transform(arr)
+            if os.path.exists(SCALER_PATH):
+                self.scaler = joblib.load(SCALER_PATH)
+                logging.info(f"Scaler berhasil dimuat dari {SCALER_PATH}")
+                # Validasi jumlah fitur scaler
+                if self.scaler.n_features_in_ != N_FEATURES:
+                    logging.error(f"Scaler mismatch! Harapan {N_FEATURES}, didapat {self.scaler.n_features_in_}")
             else:
-                # joblib scaler ada tapi bukan MinMaxScaler -> gunakan MinMaxScaler yang difit pada sequence saat ini
-                logging.warning(f'Scaler ter-load bukan MinMaxScaler; melakukan fit MinMaxScaler pada sequence saat ini untuk {source}.')
-                if _MMS is not None:
-                    local_scaler = _MMS()
-                    local_scaler.fit(arr)
-                    arr_scaled = local_scaler.transform(arr)
-                else:
-                    logging.error('sklearn tidak tersedia untuk membuat MinMaxScaler; melewati scaling')
-                    arr_scaled = arr
+                logging.critical(f"Scaler not found: {SCALER_PATH}. Predictions will not be accurate!")
         except Exception as e:
-            logging.error(f'Gagal men-scale data untuk {source}: {e}')
-            arr_scaled = arr
-    else:
-        # tidak ada scaler di disk: buat MinMaxScaler lokal dan fit pada sequence saat ini
+            logging.error(f"Error loading scaler: {e}")
+
+        # 2. Load Model
         try:
-            from sklearn.preprocessing import MinMaxScaler as _MMS
-            if _MMS is not None:
-                local_scaler = _MMS()
-                local_scaler.fit(arr)
-                arr_scaled = local_scaler.transform(arr)
+            if os.path.exists(MODEL_PATH):
+                self.model = tf.keras.models.load_model(
+                    MODEL_PATH, 
+                    custom_objects={'weighted_masked_regression_loss': weighted_masked_regression_loss},
+                    compile=False # False agar lebih cepat jika tidak akan dilatih ulang
+                )
+                logging.info(f"Model LSTM berhasil dimuat dari {MODEL_PATH}")
             else:
-                logging.error('sklearn tidak tersedia untuk membuat MinMaxScaler; melewati scaling')
-                arr_scaled = arr
+                logging.critical(f"Model not found: {MODEL_PATH}")
         except Exception as e:
-            logging.error(f'Gagal membuat/fit MinMaxScaler lokal: {e}')
-            arr_scaled = arr
+            logging.error(f"Error loading model: {e}")
 
-    # final shape expected (1, 144, 9)
-    return arr_scaled.reshape((1, SEQUENCE_LENGTH, N_FEATURES))
+    def get_rain_inverse_params(self):
+        """Mengambil parameter scale_ dan min_ khusus untuk fitur hujan (index 5) serta mengembalikan nilai asli hujan."""
+        if self.scaler is None: return None, None
+        # MinMaxScaler formula: X_std = (X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0))
+        # Sklearn menyimpan: scale_ = 1 / (max - min), min_ = -min * scale_
+        # Formula Inverse: X = (X_scaled - min_) / scale_
+        scale = self.scaler.scale_[RAIN_FEATURE_INDEX]
+        min_val = self.scaler.min_[RAIN_FEATURE_INDEX]
+        return scale, min_val
 
+# --- HELPER FUNCTIONS ---
 
-def _predict_for_source(source: str, app=None) -> Optional[List[float]]:
-    """Ambil data dari DB, prepare input dan jalankan prediksi model.
-    Mengembalikan list 24 float atau None jika gagal.
-    """
+def _calculate_hour_components(request_time):
+    """Menghitung komponen cyclical waktu (Sin/Cos)."""
+    if request_time is None: return 0.0, 0.0
+    if request_time.tzinfo is None:
+        request_time = request_time.replace(tzinfo=timezone.utc)
+    
+    # Konversi ke WIB (UTC+7)
+    wib = request_time.astimezone(timezone(timedelta(hours=7)))
+    hour_decimal = wib.hour + (wib.minute / 60.0)
+    # hour_decimal = wib.hour + (wib.minute / 60.0) + (wib.second / 3600.0)
+    angle = 2.0 * math.pi * (hour_decimal / 24.0)
+    return math.sin(angle), math.cos(angle)
+
+def _fetch_cleaned_dataframe(source: str, app) -> Optional[pd.DataFrame]:
+    """Mengambil data dan membersihkannya (Handling Missing Values)."""
+    with app.app_context():
+        try:
+            ModelClass = WeatherLogEcowitt if source == 'ecowitt' else WeatherLogWunderground
+            
+            # Ambil sedikit lebih banyak dari 144 untuk buffer imputasi
+            rows = db.session.query(ModelClass)\
+                .order_by(ModelClass.created_at.desc())\
+                .limit(SEQUENCE_LENGTH + 20)\
+                .all()
+            
+            if len(rows) < SEQUENCE_LENGTH:
+                return None
+            
+            rows.reverse() # Urutkan kronologis (Lama -> Baru)
+
+            # Konversi ke List of Dicts agar mudah jadi DataFrame
+            data = []
+            for r in rows:
+                if source == 'wunderground':
+                    solar = (float(r.solar_radiation) * WM2_TO_LUX) if r.solar_radiation is not None else 0.0
+                    item = {
+                        'suhu': float(r.temperature) if r.temperature is not None else np.nan,
+                        'kelembaban': float(r.humidity) if r.humidity is not None else np.nan,
+                        'kecepatan_angin': float(r.wind_speed) if r.wind_speed is not None else 0.0,
+                        'arah_angin': float(r.wind_direction) if r.wind_direction is not None else 0.0,
+                        'tekanan_udara': float(r.pressure) if r.pressure is not None else np.nan,
+                        'intensitas_hujan': float(r.precipitation_rate) if r.precipitation_rate is not None else 0.0,
+                        'intensitas_cahaya': solar,
+                        'req_time': r.request_time
+                    }
+                else: # ecowitt
+                    item = {
+                        'suhu': float(r.temperature_main_outdoor) if r.temperature_main_outdoor is not None else np.nan,
+                        'kelembaban': float(r.humidity_outdoor) if r.humidity_outdoor is not None else np.nan,
+                        'kecepatan_angin': float(r.wind_speed) if r.wind_speed is not None else 0.0,
+                        'arah_angin': float(r.wind_direction) if r.wind_direction is not None else 0.0,
+                        'tekanan_udara': float(r.pressure_relative) if r.pressure_relative is not None else np.nan,
+                        'intensitas_hujan': float(r.rain_rate) if r.rain_rate is not None else 0.0,
+                        'intensitas_cahaya': float(r.solar_irradiance) if r.solar_irradiance is not None else 0.0,
+                        'req_time': r.request_time
+                    }
+                data.append(item)
+
+            df = pd.DataFrame(data)
+
+            # 1. IMPUTATION: Isi NaN dengan nilai sebelumnya (Forward Fill)
+            # Pressure 0.0 atau NaN akan merusak scaler, jadi kita ffill
+            df = df.ffill().bfill()
+
+            # 2. Hitung Time Features (Sin/Cos)
+            sin_cos = df['req_time'].apply(lambda x: pd.Series(_calculate_hour_components(x)))
+            df['hour_sin'] = sin_cos[0]
+            df['hour_cos'] = sin_cos[1]
+
+            # 3. Urutkan Kolom Sesuai Scaler (SANGAT PENTING)
+            # Urutan dari scalerFIT_split.joblib 
+            feature_order = [
+                'suhu', 'kelembaban', 'kecepatan_angin', 'arah_angin', 
+                'tekanan_udara', 'intensitas_hujan', 'intensitas_cahaya', 
+                'hour_sin', 'hour_cos'
+            ]
+            
+            # Ambil hanya 144 baris terakhir
+            final_df = df[feature_order].tail(SEQUENCE_LENGTH)
+            
+            if final_df.isnull().values.any():
+                logging.warning(f"Data masih mengandung NaN setelah imputasi pada {source}")
+                return None
+
+            return final_df.values # Return numpy array
+
+        except Exception as e:
+            logging.error(f"DB Error {source}: {e}")
+            return None
+
+def _predict_task(source: str, app) -> Optional[List[float]]:
+    """Fungsi worker thread untuk melakukan prediksi."""
+    predictor = WeatherPredictor()
+    
+    if not predictor.model or not predictor.scaler: return None
+
+    # 1. Fetch & Clean Data
+    raw_data = _fetch_cleaned_dataframe(source, app) # Shape (144, 9)
+    if raw_data is None: return None
+
     try:
-        rows = _fetch_last_n_rows(source, SEQUENCE_LENGTH, app=app)
-        if rows is None:
-            logging.warning(f'Jumlah data untuk {source} kurang dari {SEQUENCE_LENGTH}; prediksi dibatalkan untuk source ini.')
-            return None
+        # 2. Scaling
+        scaled_data = predictor.scaler.transform(raw_data)
+        
+        # 3. Reshape untuk LSTM (Batch, Steps, Features) -> (1, 144, 9)
+        input_tensor = scaled_data.reshape(1, SEQUENCE_LENGTH, N_FEATURES)
 
-        x = _prepare_sequence_from_rows(rows, source)
-        if x is None:
-            logging.warning(f'Gagal menyiapkan sequence input untuk {source}')
-            return None
+        # 4. Prediksi
+        # Output shape model adalah (1, 24) 
+        pred_scaled = predictor.model.predict(input_tensor, verbose=0)
 
-        model = _load_model_if_needed()
-        if model is None:
-            logging.error('Model LSTM tidak tersedia; prediksi dibatalkan')
-            return None
+        # 5. Inverse Scaling (Khusus Hujan)
+        scale_val, min_val = predictor.get_rain_inverse_params()
+        
+        # Rumus Inverse Sklearn MinMaxScaler: (X_scaled - min_) / scale_
+        pred_mm = (pred_scaled - min_val) / scale_val
+        
+        # Bersihkan nilai (tidak boleh negatif) dan bulatkan
+        pred_final = np.maximum(pred_mm, 0.0).flatten().tolist()
+        return [round(x, 2) for x in pred_final]
 
-        # run predict
-        pred = model.predict(x)
-        # expect shape (1,24)
-        arr = np.array(pred).reshape(-1).tolist()
-        logging.info(f"[{source}] Prediksi 24 data ke depan: {arr}")
-        return arr
     except Exception as e:
-        logging.error(f'Error prediksi untuk {source}: {e}')
+        logging.error(f"Prediction logic error {source}: {e}")
         return None
-
 
 def run_parallel_lstm_predictions() -> Dict[str, Optional[List[float]]]:
-    """Fungsi publik yang menjalankan pengambilan data dan prediksi untuk kedua sumber
-    secara paralel dan mengembalikan dictionary hasil.
-    """
-    results: Dict[str, Optional[List[float]]] = {'ecowitt': None, 'wunderground': None}
-
-    sources = ['ecowitt', 'wunderground']
-
-    # Capture the current Flask app (if any) so worker threads can push app context
-    app_obj = None
+    results = {'ecowitt': None, 'wunderground': None}
     try:
         app_obj = current_app._get_current_object()
-    except Exception:
-        app_obj = None
+    except:
+        return results
+
+    WeatherPredictor() # Init singleton di main thread
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(_predict_for_source, src, app_obj): src for src in sources}
+        futures = {
+            executor.submit(_predict_task, src, app_obj): src 
+            for src in ['ecowitt', 'wunderground']
+        }
         for fut in as_completed(futures):
-            src = futures[fut]
-            try:
-                res = fut.result()
-                results[src] = res
-            except Exception as e:
-                logging.error(f'Prediksi paralel gagal untuk {src}: {e}')
-                results[src] = None
-
+            results[futures[fut]] = fut.result()
+    
     return results
-
-
-if __name__ == '__main__':
-    # simple smoke test when run directly (non-production)
-    logging.basicConfig(level=logging.INFO)
-    logging.info('Menjalankan prediksi LSTM paralel (smoke-test)')
-    out = run_parallel_lstm_predictions()
-    logging.info(f'Hasil: {out}')

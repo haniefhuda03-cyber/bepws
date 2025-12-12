@@ -11,7 +11,7 @@ from .models import (
     Label,
     Model as ModelMeta,
 )
-from .ml_model import run_prediction, LABEL_MAP
+from .ml_xgboost import run_prediction, LABEL_MAP
 from .ml_lstm import run_parallel_lstm_predictions
 from .secrets import get_secret
 from concurrent.futures import ThreadPoolExecutor
@@ -92,12 +92,24 @@ def fetch_wunderground() -> Optional[WeatherLogWunderground]:
     except Exception as e:
         logging.error(f"Gagal mengambil Wunderground: {e}")
         return None
+    
     if not data or "observations" not in data or not data["observations"]:
         logging.warning("Format respons Wunderground tidak valid atau tidak ada data observasi.")
         return None
     
     obs = data["observations"][0]
     metric_si = obs.get("metric_si", {})
+    
+    request_time_str = obs.get("obsTimeUtc")
+
+    try:
+        if request_time_str:
+            request_time_utc = datetime.fromisoformat(request_time_str.replace("Z", "+00:00"))
+        else:
+            raise ValueError("Request time tidak tersedia.")
+    except Exception:
+        request_time_utc = datetime.now(timezone.utc)
+        logging.warning("Gagal mengurai atau mendapatkan waktu permintaan dari Wunderground; menggunakan waktu saat ini (UTC) sebagai gantinya.")
 
     wl = WeatherLogWunderground(
         solar_radiation=obs.get("solarRadiation"),
@@ -110,7 +122,7 @@ def fetch_wunderground() -> Optional[WeatherLogWunderground]:
         wind_gust=metric_si.get("windGust"),
         precipitation_rate=metric_si.get("precipRate"),
         precipitation_total=metric_si.get("precipTotal"),
-        request_time=datetime.now(timezone.utc),
+        request_time=request_time_utc,
     )
     db.session.add(wl)
     db.session.commit()
@@ -158,6 +170,26 @@ def fetch_ecowitt() -> Optional[WeatherLogEcowitt]:
 
     data = response_data['data']
 
+    # --- BEST PRACTICE: PARSING REQUEST TIME ---
+    # 1. Inisialisasi default ke waktu server (UTC)
+    # Ini menjamin variabel selalu valid, bahkan jika API tidak mengirim field 'time'.
+    request_time_fix = datetime.now(timezone.utc)
+
+    # 2. Ambil nilai timestamp epoch dari root response
+    epoch_str = response_data.get('time')
+    
+    # 3. Coba override default dengan data dari API
+    if epoch_str:
+        try:
+            # Konversi Epoch (integer detik) ke Datetime UTC
+            # int(epoch_str) -> Mengubah "1765333867" menjadi integer
+            # fromtimestamp -> Mengubah integer menjadi datetime object
+            request_time_fix = datetime.fromtimestamp(int(epoch_str), tz=timezone.utc)
+        except (ValueError, TypeError) as e:
+            # Log error tapi jangan crash, biarkan menggunakan default (waktu server)
+            logging.warning(f"Gagal parsing Epoch time Ecowitt '{epoch_str}': {e}. Menggunakan waktu server.")
+    # -------------------------------------------
+
     def _get_value(source: Optional[Dict[str, Any]], key: str) -> Optional[float]:
         if source and key in source and isinstance(source[key], dict):
             val = source[key].get("value")
@@ -202,13 +234,12 @@ def fetch_ecowitt() -> Optional[WeatherLogEcowitt]:
         pressure_relative=_get_value(pressure, 'relative'),
         pressure_absolute=_get_value(pressure, 'absolute'),
         battery_sensor_array=_get_value({'sensor_array': battery}, 'sensor_array'),
-        request_time=datetime.now(timezone.utc),
+        request_time=request_time_fix,
     )
     db.session.add(wl)
     db.session.commit()
     logging.info(f"Berhasil mengambil dan menyimpan data Ecowitt (ID: {wl.id}).")
     return wl
-
 
 def fetch_and_store_weather():
     from flask import current_app

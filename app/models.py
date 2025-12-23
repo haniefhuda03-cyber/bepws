@@ -139,32 +139,43 @@ class PredictionLog(db.Model):
     __tablename__ = "prediction_log"
     id = Column(Integer, primary_key=True, autoincrement=True)
     
+    # Foreign Keys ke tabel weather log
     weather_log_wunderground_id = Column(Integer, ForeignKey('weather_log_wunderground.id'), nullable=True)
     weather_log_ecowitt_id = Column(Integer, ForeignKey('weather_log_ecowitt.id'), nullable=True)
-    model_id = Column(Integer, ForeignKey('model.id'), nullable=False)
     
-    ecowitt_prediction_result = Column(Integer, ForeignKey('label.id'), nullable=True)
-    wunderground_prediction_result = Column(Integer, ForeignKey('label.id'), nullable=True)
-
+    # Foreign Keys ke tabel model (terpisah untuk XGBoost dan LSTM)
+    xgboost_model_id = Column(Integer, ForeignKey('model.id'), nullable=True)
+    lstm_model_id = Column(Integer, ForeignKey('model.id'), nullable=True)
+    
+    # Hasil klasifikasi XGBoost (INT - label class)
+    ecowitt_predict_result = Column(Integer, nullable=True)
+    wunderground_predict_result = Column(Integer, nullable=True)
+    
+    # Output array 24 angka dari LSTM (JSON)
+    ecowitt_predict_data = Column(db.JSON, nullable=True)
+    wunderground_predict_data = Column(db.JSON, nullable=True)
+    
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), server_default=func.now())
     
+    # Relationships
     weather_log_wunderground = relationship('WeatherLogWunderground', backref='prediction_logs')
     weather_log_ecowitt = relationship('WeatherLogEcowitt', backref='prediction_logs')
-    model = relationship('Model', backref='prediction_logs')
-
-    ecowitt_label = relationship('Label', foreign_keys=[ecowitt_prediction_result])
-    wunderground_label = relationship('Label', foreign_keys=[wunderground_prediction_result])
+    xgboost_model = relationship('Model', foreign_keys=[xgboost_model_id], backref='xgboost_prediction_logs')
+    lstm_model = relationship('Model', foreign_keys=[lstm_model_id], backref='lstm_prediction_logs')
 
     def to_dict(self):
         return {
             "id": self.id,
             "weather_log_wunderground_id": self.weather_log_wunderground_id,
             "weather_log_ecowitt_id": self.weather_log_ecowitt_id,
-            "model_id": self.model_id,
-            "ecowitt_prediction_result_id": self.ecowitt_prediction_result,
-            "wunderground_prediction_result_id": self.wunderground_prediction_result,
+            "xgboost_model_id": self.xgboost_model_id,
+            "lstm_model_id": self.lstm_model_id,
+            "ecowitt_predict_result": self.ecowitt_predict_result,
+            "wunderground_predict_result": self.wunderground_predict_result,
+            "ecowitt_predict_data": self.ecowitt_predict_data,
+            "wunderground_predict_data": self.wunderground_predict_data,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
     def __repr__(self):
-        return f"<PredictionLog id={self.id} model_id={self.model_id} created_at={self.created_at}>"
+        return f"<PredictionLog id={self.id} xgboost_model_id={self.xgboost_model_id} lstm_model_id={self.lstm_model_id} created_at={self.created_at}>"

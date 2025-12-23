@@ -135,13 +135,18 @@ def data():
         return jsonify({'ok': True, 'data': resp_data}), 200
 
     if t == 'hourly':
-        # Improved hourly logic per requirements:
-        # - optional `limit` param (1..12)
-        # - query from current hour floored (WIB) forward
-        # - pick earliest record per hour (rows ordered asc)
-        # - display target time = record_time_wib + 1 hour
+        # =====================================================
+        # UPDATED: Hourly endpoint dengan dukungan query param &model=
+        # - model=lstm (default): Return prediksi intensitas hujan 24 jam
+        # - model=xgboost: Return hasil klasifikasi arah hujan
+        # =====================================================
         WIB = timezone(timedelta(hours=7))
-
+        
+        # Parse `model` param (default: lstm)
+        model_param = request.args.get('model', 'lstm').lower()
+        if model_param not in ('lstm', 'xgboost'):
+            return jsonify({'ok': False, 'message': "invalid model; gunakan 'lstm' atau 'xgboost'"}), 400
+        
         # Parse `limit` param
         limit_param = request.args.get('limit')
         limit = None
@@ -150,109 +155,131 @@ def data():
                 limit = int(limit_param)
             except Exception:
                 return jsonify({'ok': False, 'message': 'invalid limit'}), 400
-            if limit < 1 or limit > 12:
-                return jsonify({'ok': False, 'message': 'limit harus antara 1 dan 12'}), 400
-
-        # Current time in WIB and floored to hour
-        now_utc = datetime.now(timezone.utc)
-        now_wib = now_utc.astimezone(WIB)
-        start_of_current_hour_wib = now_wib.replace(minute=0, second=0, microsecond=0)
-
-        # Convert to UTC for DB query
-        start_dt_utc = start_of_current_hour_wib.astimezone(timezone.utc)
-
-        q = db.session.query(models.PredictionLog).filter(models.PredictionLog.created_at >= start_dt_utc)
-
+            if limit < 1 or limit > 24:
+                return jsonify({'ok': False, 'message': 'limit harus antara 1 dan 24'}), 400
+        
+        # Ambil prediksi terbaru
+        pl = db.session.query(models.PredictionLog).order_by(
+            models.PredictionLog.created_at.desc()
+        ).first()
+        
+        if not pl:
+            return jsonify({'ok': False, 'message': 'No prediction data available'}), 404
+        
         source_param_provided = 'source' in request.args
-        if source_param_provided:
+        
+        # =====================================================
+        # MODEL = LSTM: Return array 24 jam prediksi intensitas hujan
+        # =====================================================
+        if model_param == 'lstm':
+            from .services.prediction_service import get_model_info
+            
+            # Ambil data LSTM dari prediction_log
             if source == 'ecowitt':
-                q = q.filter(models.PredictionLog.weather_log_ecowitt_id.isnot(None))
-            elif source == 'wunderground':
-                q = q.filter(models.PredictionLog.weather_log_wunderground_id.isnot(None))
-
-        rows = q.order_by(models.PredictionLog.created_at.asc()).all()
-
-        seen_hours = set()
-        hours = []
-
-        for pl in rows:
-            if not pl or not pl.created_at:
-                continue
-
-            created = pl.created_at
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-
-            created_wib = created.astimezone(WIB)
-
-            # Use date+hour key to avoid collisions across days
-            hour_key = created_wib.strftime('%Y-%m-%d %H')
-
-            if hour_key in seen_hours:
-                continue
-
-            # keep earliest record for this hour (rows ordered asc)
-            seen_hours.add(hour_key)
-
-            # prediction target (display) = record_time + 1 hour
-            display_time = created_wib + timedelta(hours=1)
-
-            # Only include future prediction targets
-            if display_time <= now_wib:
-                continue
-
-            date_str = display_time.strftime('%Y-%m-%d')
-            time_str = display_time.strftime('%H:%M')
-
-            temp = None
-            weather_predict = None
-
-            if source_param_provided:
-                if source == 'ecowitt':
-                    wl = pl.weather_log_ecowitt
-                    label = pl.ecowitt_label
-                    if wl:
-                        temp = wl.temperature_main_outdoor
-                    if label:
-                        weather_predict = label.name
-                else:
-                    wl = pl.weather_log_wunderground
-                    label = pl.wunderground_label
-                    if wl:
-                        temp = wl.temperature
-                    if label:
-                        weather_predict = label.name
+                lstm_data = pl.ecowitt_predict_data
             else:
-                if getattr(pl, 'weather_log_ecowitt', None):
-                    wl = pl.weather_log_ecowitt
-                    label = pl.ecowitt_label
-                    if wl:
-                        temp = wl.temperature_main_outdoor
-                    if label:
-                        weather_predict = label.name
-                else:
-                    wl = pl.weather_log_wunderground
-                    label = pl.wunderground_label
-                    if wl:
-                        temp = wl.temperature
-                    if label:
-                        weather_predict = label.name
-
-            hours.append({
+                lstm_data = pl.wunderground_predict_data
+            
+            if not lstm_data:
+                return jsonify({'ok': False, 'message': f'No LSTM prediction data for {source}'}), 404
+            
+            # Pastikan created_at ada timezone
+            created_at = pl.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            created_at_wib = created_at.astimezone(WIB)
+            
+            # Ambil model info dari database via relasi
+            lstm_model_db = pl.lstm_model
+            lstm_model_info = get_model_info('lstm')
+            
+            # Buat array predictions dengan waktu dikalkulasi dinamis
+            # Mulai dari created_at + 1 jam, dst
+            predictions = []
+            total_available = len(lstm_data)
+            
+            for i, value in enumerate(lstm_data):
+                # Jika limit diberikan, batasi jumlah data
+                if limit is not None and len(predictions) >= limit:
+                    break
+                
+                # Waktu prediksi = created_at + (i+1) jam
+                pred_time = created_at_wib + timedelta(hours=i+1)
+                
+                predictions.append({
+                    'hour': i + 1,  # Jam ke-1, ke-2, dst dari waktu prediksi
+                    'datetime': pred_time.isoformat(),
+                    'date': pred_time.strftime('%Y-%m-%d'),
+                    'time': pred_time.strftime('%H:%M'),
+                    'value': value,  # Intensitas hujan (mm/jam)
+                })
+            
+            response_data = {
+                'ok': True,
+                'model': {
+                    'id': lstm_model_db.id if lstm_model_db else lstm_model_info['id'],
+                    'name': lstm_model_db.name if lstm_model_db else lstm_model_info['name'],
+                    'range_prediction': lstm_model_db.range_prediction if lstm_model_db else lstm_model_info['range_prediction'],
+                },
+                'prediction': {
+                    'id': pl.id,
+                    'source': source,
+                    'predicted_at': created_at_wib.isoformat(),
+                    'total_hours': total_available,
+                    'showing': len(predictions),
+                    'limit_applied': limit,
+                },
+                'data': predictions,
+            }
+            
+            if source_param_provided:
+                key = 'weather_ecowitt' if source == 'ecowitt' else 'weather_wunderground'
+                return jsonify({'ok': True, 'model': 'lstm', 'data': {key: predictions}}), 200
+            return jsonify(response_data), 200
+        
+        # =====================================================
+        # MODEL = XGBOOST: Return hasil klasifikasi
+        # =====================================================
+        else:  # xgboost
+            from .services.prediction_service import get_label_from_db, get_model_info
+            
+            if source == 'ecowitt':
+                xgboost_result = pl.ecowitt_predict_result
+            else:
+                xgboost_result = pl.wunderground_predict_result
+            
+            # Pastikan created_at ada timezone
+            created_at = pl.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            created_at_wib = created_at.astimezone(WIB)
+            
+            # Ambil label dari database
+            label_info = get_label_from_db(xgboost_result) if xgboost_result is not None else None
+            
+            # Ambil model info dari database
+            xgboost_model_info = get_model_info('xgboost')
+            
+            # Ambil info model dari relasi jika tersedia
+            model_db = pl.xgboost_model
+            
+            result = {
                 'id': pl.id,
-                'date': date_str,
-                'time': time_str,
-                'temp': temp,
-                'weather_predict': weather_predict,
-            })
-
-            if limit is not None and len(hours) >= limit:
-                break
-
-        if source_param_provided:
-            key = 'weather_ecowitt' if source == 'ecowitt' else 'weather_wunderground'
-            return jsonify({'ok': True, 'hours': {key: hours}}), 200
-        return jsonify({'ok': True, 'hours': hours}), 200
+                'model': {
+                    'type': 'xgboost',
+                    'id': model_db.id if model_db else xgboost_model_info['id'],
+                    'name': model_db.name if model_db else xgboost_model_info['name'],
+                    'range_prediction': model_db.range_prediction if model_db else xgboost_model_info['range_prediction'],
+                },
+                'source': source,
+                'created_at': created_at_wib.isoformat(),
+                'label': label_info,
+            }
+            
+            if source_param_provided:
+                key = 'weather_ecowitt' if source == 'ecowitt' else 'weather_wunderground'
+                return jsonify({'ok': True, 'model': 'xgboost', 'data': {key: result}}), 200
+            return jsonify({'ok': True, 'model': 'xgboost', 'data': result}), 200
 
     if t == 'details':
         allowed = {'type', 'id', 'source', 'api_key'}
@@ -358,7 +385,16 @@ def get_history():
     else:
         source = 'ecowitt'
 
-    per_page = 5
+    # Parse per_page (default: 10, max: 50)
+    try:
+        per_page = int(request.args.get('per_page', '10'))
+    except:
+        per_page = 10
+    if per_page < 1:
+        per_page = 10
+    if per_page > 50:
+        per_page = 50
+    
     offset = (page - 1) * per_page
 
     WIB_TZ = timezone(timedelta(hours=7))
@@ -607,10 +643,18 @@ def graph():
     if not ok:
         return rest[0]
 
+    # Required parameters
     range_param = request.args.get('range')
-    month = request.args.get('month')
-    source = request.args.get('source')
+    if not range_param:
+        return jsonify({'ok': False, 'message': "Parameter 'range' is required (weekly or monthly)"}), 400
+    
     datatype = request.args.get('datatype')
+    if not datatype:
+        return jsonify({'ok': False, 'message': "Parameter 'datatype' is required (temperature, humidity, rainfall, wind_speed, uvi, solar_radiation, relative_pressure)"}), 400
+    
+    # Optional parameters
+    month = request.args.get('month')
+    source = request.args.get('source', 'ecowitt')
 
     payload = serializers.get_graph_payload(range_param, month=month, source=source, datatype=datatype)
     if not payload.get('ok'):

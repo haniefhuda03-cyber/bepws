@@ -38,9 +38,24 @@ def create_app():
     is_mgmt = _is_management_command()
     argv = ' '.join(sys.argv).lower()
 
-    log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
+    log_level = os.environ.get('LOG_LEVEL', None)
     try:
-        configure_logging(level=getattr(logging, log_level, logging.INFO))
+        # Jika menjalankan perintah manajemen (migrate/upgrade/init), kurangi noise logging
+        if is_mgmt:
+            # Kurangi pesan TF / oneDNN di environment saat manajemen
+            os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+            # Jika tidak ada override LOG_LEVEL, set ke WARNING agar hanya pesan penting tampil
+            if not log_level:
+                configure_logging(level=logging.WARNING)
+            else:
+                configure_logging(level=getattr(logging, log_level.upper(), logging.WARNING))
+            # Pastikan logger db_seed tetap INFO agar seeding terlihat
+            try:
+                logging.getLogger('db_seed').setLevel(logging.INFO)
+            except Exception:
+                pass
+        else:
+            configure_logging(level=getattr(logging, (log_level or 'INFO').upper(), logging.INFO))
     except Exception:
         logging.warning('Gagal mengonfigurasi logging, menggunakan konfigurasi default.')
 
@@ -82,7 +97,16 @@ def create_app():
         SCHEDULER_API_ENABLED=True,
     )
 
-    CORS(app, resources={r"/api/*": {"origins" : "*"}})
+    CORS(app, resources={
+        r"/api/*": {
+            "origins": "*",
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "X-API-KEY", "Authorization"],
+            "expose_headers": ["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
+            "supports_credentials": False,
+            "max_age": 600,
+        }
+    })
 
     db.init_app(app)
 
@@ -142,8 +166,16 @@ def create_app():
             from . import models
 
         try:
+            # Register API v1/v2 (legacy) blueprint
             from .api import bp as api_bp
             app.register_blueprint(api_bp, url_prefix='/api')
+            
+            # Register API v3 blueprint
+            from .api_v3 import bp_v3 as api_v3_bp
+            app.register_blueprint(api_v3_bp, url_prefix='/api/v3')
+            
+            logging.info('Registered API blueprints: /api (legacy), /api/v3')
+            
             try:
                 from . import serializers as _serializers
                 _serializers._CURRENT_CACHE = {'ts': None, 'data': None, 'ttl': 30}

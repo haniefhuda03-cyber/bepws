@@ -11,8 +11,6 @@ from .models import (
     Label,
     Model as ModelMeta,
 )
-from .ml_xgboost import run_prediction, LABEL_MAP
-from .ml_lstm import run_parallel_lstm_predictions
 from .secrets import get_secret
 from concurrent.futures import ThreadPoolExecutor
 import random
@@ -242,6 +240,11 @@ def fetch_ecowitt() -> Optional[WeatherLogEcowitt]:
     return wl
 
 def fetch_and_store_weather():
+    """
+    Job untuk mengambil dan menyimpan data cuaca dari Wunderground dan Ecowitt.
+    Berjalan setiap 5 menit.
+    TIDAK melakukan prediksi - prediksi dilakukan di job terpisah.
+    """
     from flask import current_app
     appctx = None
     if getattr(scheduler, 'app', None) is not None:
@@ -249,7 +252,7 @@ def fetch_and_store_weather():
     else:
         appctx = current_app.app_context()
     with appctx:
-        logging.info(f"[{datetime.now(timezone.utc)}] Memulai pipeline ambil/simpan/prediksi...")
+        logging.info(f"[{datetime.now(timezone.utc)}] Memulai pengambilan data cuaca...")
 
         wu_log, eco_log = None, None
         try:
@@ -265,77 +268,43 @@ def fetch_and_store_weather():
             db.session.rollback()
 
         if not wu_log and not eco_log:
-            logging.info(f"[{datetime.now(timezone.utc)}] Tidak ada data yang diambil dari sumber manapun. Pipeline selesai.")
+            logging.info(f"[{datetime.now(timezone.utc)}] Tidak ada data yang diambil dari sumber manapun.")
             return
 
-        model_meta = db.session.query(ModelMeta).first()
-        if not model_meta:
-            logging.warning("Tidak ada entri Model di database. Prediksi akan dilewati.")
-            return
+        logging.info(f"[{datetime.now(timezone.utc)}] Data cuaca berhasil diambil. WU ID: {wu_log.id if wu_log else None}, ECO ID: {eco_log.id if eco_log else None}")
 
-        pl = PredictionLog(
-            weather_log_wunderground_id=wu_log.id if wu_log else None,
-            weather_log_ecowitt_id=eco_log.id if eco_log else None,
-            model_id=model_meta.id,
-        )
-        db.session.add(pl)
-        db.session.commit()
 
-        prediction_tasks = {}
-        if wu_log:
-            features_wu = {
-                'suhu': float(wu_log.temperature) if wu_log.temperature is not None else None,
-                'kelembaban': float(wu_log.humidity) if wu_log.humidity is not None else None,
-                'kecepatan_angin': float(wu_log.wind_speed) if wu_log.wind_speed is not None else None,
-                'arah_angin': float(wu_log.wind_direction) if wu_log.wind_direction is not None else None,
-                'tekanan_udara': float(wu_log.pressure) if wu_log.pressure is not None else None,
-                'intensitas_hujan': float(wu_log.precipitation_rate) if wu_log.precipitation_rate is not None else 0.0,
-            }
-            prediction_tasks['wunderground'] = features_wu
-
-        if eco_log:
-            features_eco = {
-                'suhu': float(eco_log.temperature_main_outdoor) if eco_log.temperature_main_outdoor is not None else None,
-                'kelembaban': float(eco_log.humidity_outdoor) if eco_log.humidity_outdoor is not None else None,
-                'kecepatan_angin': float(eco_log.wind_speed) if eco_log.wind_speed is not None else None,
-                'arah_angin': float(eco_log.wind_direction) if eco_log.wind_direction is not None else None,
-                'tekanan_udara': float(eco_log.pressure_relative) if eco_log.pressure_relative is not None else None,
-                'intensitas_hujan': float(eco_log.rain_rate) if eco_log.rain_rate is not None else 0.0,
-            }
-            prediction_tasks['ecowitt'] = features_eco
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_to_source = {executor.submit(run_prediction, features): source for source, features in prediction_tasks.items()}
-
-            for future in future_to_source:
-                source = future_to_source[future]
-                try:
-                    label_value = future.result(timeout=30)
-                    logging.info(f"Prediksi untuk {source} menghasilkan label: {label_value}")
-
-                    if label_value is not None:
-                        label_text = LABEL_MAP.get(label_value, 'Label tidak diketahui')
-                        label = db.session.query(Label).filter_by(name=label_text).first()
-
-                        if not label:
-                            label = Label(name=label_text)
-                            db.session.add(label)
-                            db.session.commit()
-
-                        if source == 'wunderground':
-                            pl.wunderground_prediction_result = label.id
-                        elif source == 'ecowitt':
-                            pl.ecowitt_prediction_result = label.id
-
-                except Exception as e:
-                    logging.error(f"Prediksi gagal untuk {source}: {e}")
-        db.session.commit()
-
-        # Jalankan prediksi LSTM secara paralel untuk kedua sumber (tidak disimpan ke DB)
+def run_hourly_prediction():
+    """
+    Job untuk menjalankan prediksi cuaca.
+    Berjalan setiap JAM (menit ke-00), terpisah dari job fetching data.
+    Menggunakan prediction_service dengan layering architecture.
+    """
+    from flask import current_app
+    appctx = None
+    if getattr(scheduler, 'app', None) is not None:
+        appctx = scheduler.app.app_context()
+    else:
+        appctx = current_app.app_context()
+    
+    with appctx:
+        logging.info(f"[{datetime.now(timezone.utc)}] Memulai job prediksi per jam...")
+        
         try:
-            lstm_results = run_parallel_lstm_predictions()
-            logging.info(f"LSTM Prediksi hasil (tidak disimpan ke DB): {lstm_results}")
+            # Import prediction service
+            from .services.prediction_service import run_prediction_pipeline, initialize_models
+            
+            # Pastikan model sudah diinisialisasi
+            initialize_models()
+            
+            # Jalankan pipeline prediksi
+            result = run_prediction_pipeline()
+            
+            if result:
+                logging.info(f"[{datetime.now(timezone.utc)}] Prediksi berhasil. PredictionLog ID: {result.id}")
+            else:
+                logging.warning(f"[{datetime.now(timezone.utc)}] Prediksi tidak menghasilkan data.")
+                
         except Exception as e:
-            logging.error(f"Gagal menjalankan prediksi LSTM: {e}")
-
-        logging.info(f"[{datetime.now(timezone.utc)}] PredictionLog diperbarui dengan hasil (ID: {pl.id}). Pipeline selesai.")
+            logging.error(f"Error saat menjalankan prediksi per jam: {e}")
+            db.session.rollback()

@@ -9,29 +9,57 @@ from . import models
 _CURRENT_CACHE = {}
 
 
+def _get_prediction_label(class_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Helper untuk mengkonversi class_id XGBoost ke format label dari database."""
+    if class_id is None:
+        return None
+    
+    # Import get_label_from_db yang mengambil dari database
+    try:
+        from .services.prediction_service import get_label_from_db
+        return get_label_from_db(class_id)
+    except Exception:
+        # Fallback ke hardcoded LABEL_MAP jika error
+        try:
+            from .services.prediction_service import LABEL_MAP
+            label_name = LABEL_MAP.get(class_id, 'Unknown')
+            return {"label_id": None, "class_id": class_id, "name": label_name}
+        except Exception:
+            return {"label_id": None, "class_id": class_id, "name": "Unknown"}
+
+
 def _serialize_prediction_log(pl: models.PredictionLog, source: Optional[str] = None) -> Dict[str, Any]:
+    # Model info - sekarang ada xgboost_model dan lstm_model
+    xgboost_model_dict = pl.xgboost_model.to_dict() if pl.xgboost_model else None
+    lstm_model_dict = pl.lstm_model.to_dict() if pl.lstm_model else None
+    
     base = {
         "id": pl.id,
-        "model": pl.model.to_dict() if pl.model else None,
+        "xgboost_model": xgboost_model_dict,
+        "lstm_model": lstm_model_dict,
         "created_at": pl.created_at.isoformat() if pl.created_at else None,
     }
 
     if source == 'wunderground':
         base.update({
             "weather_wunderground": pl.weather_log_wunderground.to_dict() if pl.weather_log_wunderground else None,
-            "wunderground_prediction": pl.wunderground_label.to_dict() if pl.wunderground_label else None,
+            "wunderground_prediction": _get_prediction_label(pl.wunderground_predict_result),
+            "wunderground_lstm_data": pl.wunderground_predict_data,
         })
     elif source == 'ecowitt':
         base.update({
             "weather_ecowitt": pl.weather_log_ecowitt.to_dict() if pl.weather_log_ecowitt else None,
-            "ecowitt_prediction": pl.ecowitt_label.to_dict() if pl.ecowitt_label else None,
+            "ecowitt_prediction": _get_prediction_label(pl.ecowitt_predict_result),
+            "ecowitt_lstm_data": pl.ecowitt_predict_data,
         })
     else:
         base.update({
             "weather_wunderground": pl.weather_log_wunderground.to_dict() if pl.weather_log_wunderground else None,
             "weather_ecowitt": pl.weather_log_ecowitt.to_dict() if pl.weather_log_ecowitt else None,
-            "wunderground_prediction": pl.wunderground_label.to_dict() if pl.wunderground_label else None,
-            "ecowitt_prediction": pl.ecowitt_label.to_dict() if pl.ecowitt_label else None,
+            "wunderground_prediction": _get_prediction_label(pl.wunderground_predict_result),
+            "ecowitt_prediction": _get_prediction_label(pl.ecowitt_predict_result),
+            "wunderground_lstm_data": pl.wunderground_predict_data,
+            "ecowitt_lstm_data": pl.ecowitt_predict_data,
         })
 
     return base
@@ -88,9 +116,9 @@ def get_latest5_payload(source: Optional[str] = None) -> Dict[str, Any]:
     pls = db.session.query(models.PredictionLog).order_by(models.PredictionLog.created_at.desc()).limit(5).all()
     if source:
         if source.lower() == 'wunderground':
-            pls = [p for p in pls if p.wunderground_prediction_result is not None]
+            pls = [p for p in pls if p.wunderground_predict_result is not None]
         elif source.lower() == 'ecowitt':
-            pls = [p for p in pls if p.ecowitt_prediction_result is not None]
+            pls = [p for p in pls if p.ecowitt_predict_result is not None]
     payload = {"ok": True, "count": len(pls), "data": [_serialize_prediction_log(p, source) for p in pls]}
     return payload
 
@@ -120,16 +148,21 @@ def get_history_payload(page: int = 1, start_date: Optional[str] = None, end_dat
 
     if model_id:
         try:
-            q = q.filter(models.PredictionLog.model_id == int(model_id))
+            # Filter berdasarkan xgboost_model_id atau lstm_model_id
+            from sqlalchemy import or_
+            q = q.filter(or_(
+                models.PredictionLog.xgboost_model_id == int(model_id),
+                models.PredictionLog.lstm_model_id == int(model_id)
+            ))
         except (ValueError, TypeError):
             return {"ok": False, "message": "model_id harus berupa integer"}
 
     if data_source:
         ds = data_source.lower()
         if ds == 'wunderground':
-            q = q.filter(models.PredictionLog.wunderground_prediction_result.isnot(None))
+            q = q.filter(models.PredictionLog.wunderground_predict_result.isnot(None))
         elif ds == 'ecowitt':
-            q = q.filter(models.PredictionLog.ecowitt_prediction_result.isnot(None))
+            q = q.filter(models.PredictionLog.ecowitt_predict_result.isnot(None))
         else:
             return {"ok": False, "message": "data_source harus 'wunderground' atau 'ecowitt'"}
 
@@ -157,9 +190,9 @@ def get_source_current_payload(source: str) -> Dict[str, Any]:
         return {"ok": False, "message": "invalid source"}
 
     if source == 'wunderground':
-        pl = db.session.query(models.PredictionLog).filter(models.PredictionLog.wunderground_prediction_result.isnot(None)).order_by(models.PredictionLog.created_at.desc()).first()
+        pl = db.session.query(models.PredictionLog).filter(models.PredictionLog.wunderground_predict_result.isnot(None)).order_by(models.PredictionLog.created_at.desc()).first()
     else:
-        pl = db.session.query(models.PredictionLog).filter(models.PredictionLog.ecowitt_prediction_result.isnot(None)).order_by(models.PredictionLog.created_at.desc()).first()
+        pl = db.session.query(models.PredictionLog).filter(models.PredictionLog.ecowitt_predict_result.isnot(None)).order_by(models.PredictionLog.created_at.desc()).first()
 
     if not pl:
         return {"ok": False, "message": f"No {source} prediction logs found"}

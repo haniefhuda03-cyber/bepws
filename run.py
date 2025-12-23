@@ -1,5 +1,4 @@
 from app import create_app, scheduler
-from app import jobs
 import os
 import logging
 
@@ -7,9 +6,26 @@ app = create_app()
 
 def _start_scheduler_and_jobs():
     from datetime import datetime
+    # Import jobs here to avoid importing ML modules (tf/joblib) at module
+    # import time. This prevents ML libraries from being loaded during
+    # management commands like `flask db migrate` / `flask db upgrade`.
+    from app import jobs
+    
+    # Inisialisasi model ML saat startup
+    try:
+        from app.services.prediction_service import initialize_models
+        initialize_models()
+        logging.info("Model ML berhasil diinisialisasi saat startup.")
+    except Exception as e:
+        logging.warning(f"Gagal menginisialisasi model ML: {e}")
+    
     try:
         if not scheduler.running:
             scheduler.start()
+        
+        # =====================================================
+        # Job 1: Fetch Weather Data (setiap 5 menit)
+        # =====================================================
         if scheduler.get_job('fetch-weather'):
             scheduler.remove_job('fetch-weather')
         scheduler.add_job(
@@ -19,7 +35,23 @@ def _start_scheduler_and_jobs():
             minutes=5,
             next_run_time=datetime.now()
         )
-        logging.info("Scheduler dimulai dan job 'fetch-weather' didaftarkan (interval 5 menit, run segera saat startup).")
+        logging.info("Job 'fetch-weather' didaftarkan (interval 5 menit).")
+        
+        # =====================================================
+        # Job 2: Hourly Prediction (setiap jam, menit ke-00)
+        # =====================================================
+        if scheduler.get_job('hourly-prediction'):
+            scheduler.remove_job('hourly-prediction')
+        scheduler.add_job(
+            id='hourly-prediction',
+            func=jobs.run_hourly_prediction,
+            trigger='cron',
+            minute=0,  # Berjalan setiap jam di menit ke-00
+            next_run_time=datetime.now()  # Jalankan juga saat startup
+        )
+        logging.info("Job 'hourly-prediction' didaftarkan (setiap jam di menit ke-00).")
+        
+        logging.info("Scheduler dimulai dengan 2 jobs: fetch-weather (5 min) dan hourly-prediction (setiap jam).")
     except Exception as e:
         logging.warning(f"Gagal memulai scheduler atau menambah job: {e}")
 

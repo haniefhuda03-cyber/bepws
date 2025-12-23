@@ -67,14 +67,30 @@ def seed_labels_and_models(database_url: Optional[str] = None, model_path: Optio
                 cntm = conn.execute(text('SELECT COUNT(*) AS cnt FROM model')).scalar()
                 _log(f"[db_seed] model count={cntm}")
                 if cntm == 0:
-                    if os.path.exists(model_path):
-                        conn.execute(text('INSERT INTO model (name, range_prediction) VALUES (:name, :range)'),
-                                     {'name': 'default_xgboost', 'range': 60})
-                        _log('[db_seed] Seeded table `model`.')
-                    else:
-                        _log(f"[db_seed] Model file not found at {model_path}; skipping model seed.")
+                    # Seed default models: XGBoost dan LSTM
+                    models_to_seed = [
+                        {'name': 'default_xgboost', 'range': 60},
+                        {'name': 'default_lstm', 'range': 1440},  # 1440 menit = 24 jam prediksi
+                    ]
+                    for m in models_to_seed:
+                        conn.execute(
+                            text('INSERT INTO model (name, range_prediction) VALUES (:name, :range)'),
+                            m
+                        )
+                    _log(f'[db_seed] Seeded table `model` with {len(models_to_seed)} entries.')
                 else:
-                    _log('[db_seed] model already seeded; skipping.')
+                    # Cek apakah LSTM sudah ada
+                    lstm_exists = conn.execute(
+                        text("SELECT COUNT(*) FROM model WHERE name LIKE '%lstm%'")
+                    ).scalar()
+                    if lstm_exists == 0:
+                        conn.execute(
+                            text('INSERT INTO model (name, range_prediction) VALUES (:name, :range)'),
+                            {'name': 'default_lstm', 'range': 1440}
+                        )
+                        _log('[db_seed] Added missing LSTM model.')
+                    else:
+                        _log('[db_seed] model already seeded; skipping.')
             except Exception as e:
                 _log(f'[db_seed] Failed to seed model: {e}')
         else:

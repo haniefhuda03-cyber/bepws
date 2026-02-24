@@ -8,7 +8,8 @@ Service layer untuk menangani prediksi cuaca menggunakan:
 Fitur:
 - Singleton Model Loading: Model dimuat sekali saat aplikasi start
 - Smart Interpolation: Resampling data hanya jika ada data bolong
-- Sequential Pipeline: Proses Ecowitt -> Wunderground -> Save dalam satu transaksi
+- Parallel Pipeline: 3 sumber diproses paralel, XGBoost→LSTM sekuensial per sumber
+- Partial Save: Simpan hasil yang berhasil (XGBoost/LSTM/keduanya)
 """
 
 import os
@@ -17,19 +18,28 @@ import logging
 import threading
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Tuple, Any
-from sqlalchemy import func
 
 # Flask & DB Imports
 from flask import current_app
 from .. import db
+from sqlalchemy.orm import load_only
 from ..models import (
     WeatherLogEcowitt,
     WeatherLogWunderground,
+    WeatherLogConsole,
     PredictionLog,
+    DataXGBoost,
+    DataLSTM,
+    XGBoostPredictionResult,
+    LSTMPredictionResult,
     Model as ModelMeta,
+    Label,
 )
+from ..common import helpers
 
 # =====================================================================
 # KONFIGURASI PATH & KONSTANTA
@@ -43,11 +53,22 @@ SCALER_PATH = os.path.join(BASE_DIR, 'ml_models', 'scalerFIT_split.joblib')
 SEQUENCE_LENGTH = 144       # 144 data points = 12 jam (5 menit interval)
 PREDICTION_STEPS = 24       # Output: 24 timestep ke depan (24 jam)
 N_FEATURES = 9              # Jumlah fitur sesuai scaler
-WM2_TO_LUX = 126.7          # Konversi estimasi radiasi matahari ke lux
 RAIN_FEATURE_INDEX = 5      # Index kolom 'intensitas_hujan' pada scaler
 DATA_INTERVAL_MINUTES = 5   # Interval waktu antar data point
+MAX_INTERPOLATED_RATIO = 0.25  # Maks 25% data boleh hasil interpolasi
 
-# Mapping label XGBoost
+# Thread safety: Lock untuk LSTM predict() — TF tidak menjamin thread-safety secara resmi
+_lstm_predict_lock = threading.Lock()
+
+# =====================================================================
+# UNIT CONVERSION (Imperial → Metric) untuk Console
+# Hanya digunakan saat prediksi, TIDAK mengubah data di database
+# =====================================================================
+
+# ──────────────────────────────────────────────────────────
+# Mapping label XGBoost — Single Source of Truth
+# Jika label berubah, update juga di: app/db_seed.py (label_map_local)
+# ──────────────────────────────────────────────────────────
 LABEL_MAP = {
     0: 'Cerah / Berawan',
     1: 'Berpotensi Hujan dari Arah Utara',
@@ -70,6 +91,26 @@ LSTM_FEATURE_ORDER = [
     'tekanan_udara', 'intensitas_hujan', 'intensitas_cahaya', 
     'hour_sin', 'hour_cos'
 ]
+
+# =====================================================================
+# SOURCE RESULT CONTAINER
+# =====================================================================
+
+@dataclass
+class SourceResult:
+    """
+    Container untuk hasil prediksi per sumber (thread-safe).
+    
+    Digunakan oleh _process_source() untuk menyimpan hasil XGBoost dan LSTM
+    dari satu sumber data (console/ecowitt/wunderground).
+    """
+    source: str
+    weather_id: Optional[int] = None
+    xgboost: Optional[int] = None          # Class 0-8, None jika gagal
+    lstm: Optional[List[float]] = None     # Array 24 float, None jika gagal
+    lstm_ids: Optional[List[int]] = None   # 144 IDs yang digunakan LSTM
+    xgboost_error: Optional[str] = None    # Error message jika XGBoost gagal
+    lstm_error: Optional[str] = None       # Error message jika LSTM gagal
 
 # =====================================================================
 # SINGLETON MODEL LOADER
@@ -142,7 +183,7 @@ class ModelLoader:
     def _load_lstm(self):
         """Load model LSTM."""
         try:
-            import tensorflow as tf
+            import tensorflow as tf  # type: ignore[import-unresolved]
             
             # Custom loss function untuk model Keras
             @tf.keras.utils.register_keras_serializable()
@@ -170,13 +211,46 @@ class ModelLoader:
             logging.error(f"Error loading LSTM model: {e}")
     
     def get_rain_inverse_params(self) -> Tuple[Optional[float], Optional[float]]:
-        """Mengambil parameter untuk inverse scaling hasil prediksi hujan."""
+        """
+        Mengambil parameter untuk inverse scaling hasil prediksi hujan.
+        
+        MinMaxScaler formula:
+        - Scaling:   X_scaled = (X - data_min) / data_range = X * scale_ + min_
+        - Inverse:   X = (X_scaled - min_) / scale_
+        
+        Untuk MinMaxScaler sklearn:
+        - scale_ = 1 / (data_max - data_min)
+        - min_ = -data_min / (data_max - data_min)
+        
+        Jadi inverse adalah: X = (X_scaled - min_) / scale_
+        """
         if self.scaler is None:
             return None, None
         try:
             scale = self.scaler.scale_[RAIN_FEATURE_INDEX]
             min_val = self.scaler.min_[RAIN_FEATURE_INDEX]
             return scale, min_val
+        except Exception:
+            return None, None
+    
+    def get_rain_data_range(self) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Mengambil data_min dan data_max asli untuk inverse scaling.
+        
+        Dari MinMaxScaler:
+        - data_min = -min_ / scale_
+        - data_max = (1 - min_) / scale_
+        """
+        if self.scaler is None:
+            return None, None
+        try:
+            scale = self.scaler.scale_[RAIN_FEATURE_INDEX]
+            min_val = self.scaler.min_[RAIN_FEATURE_INDEX]
+            
+            data_min = -min_val / scale
+            data_max = (1.0 - min_val) / scale
+            
+            return data_min, data_max
         except Exception:
             return None, None
 
@@ -217,49 +291,101 @@ def _calculate_hour_components(request_time: datetime) -> Tuple[float, float]:
     return math.sin(angle), math.cos(angle)
 
 
+def _normalize_timestamp_to_5min(ts: datetime) -> datetime:
+    """
+    Normalisasi timestamp ke kelipatan 5 menit terdekat (floor).
+    Mengabaikan detik - hanya melihat menit.
+    
+    Contoh:
+    - 14:07:45 -> 14:05:00
+    - 14:23:12 -> 14:20:00
+    - 14:00:59 -> 14:00:00
+    """
+    if ts is None:
+        return ts
+    
+    # Floor ke kelipatan 5 menit
+    floored_minute = (ts.minute // 5) * 5
+    
+    # Buat timestamp baru dengan detik = 0
+    return ts.replace(minute=floored_minute, second=0, microsecond=0)
+
+
 def _check_data_needs_interpolation(timestamps: List[datetime]) -> bool:
     """
     Cek apakah data memerlukan interpolasi.
     Return True jika ada data bolong atau interval tidak pas 5 menit.
+    
+    Pengecekan dilakukan pada timestamp yang sudah dinormalisasi ke 5 menit.
     """
     if len(timestamps) < 2:
         return False
     
-    for i in range(1, len(timestamps)):
-        diff = (timestamps[i] - timestamps[i-1]).total_seconds()
+    # Normalisasi semua timestamp dulu
+    normalized = [_normalize_timestamp_to_5min(ts) for ts in timestamps]
+    
+    for i in range(1, len(normalized)):
+        diff = (normalized[i] - normalized[i-1]).total_seconds()
         expected = DATA_INTERVAL_MINUTES * 60  # 300 detik
-        # Toleransi 30 detik
-        if abs(diff - expected) > 30:
+        
+        # Jika beda tidak tepat 5 menit (ada gap atau duplikat)
+        if diff != expected:
             return True
+    
     return False
 
 
 def _resample_and_interpolate(df: pd.DataFrame, timestamp_col: str = 'timestamp') -> pd.DataFrame:
     """
-    Resample data ke interval 5 menit dan interpolasi nilai yang hilang.
-    Menggunakan Pandas untuk interpolasi linear.
+    Resample data ke interval 5 menit tepat dan interpolasi nilai yang hilang.
+    
+    Proses:
+    1. Normalisasi timestamp ke kelipatan 5 menit (floor, abaikan detik)
+    2. Hapus duplikat (ambil rata-rata jika ada duplikat)
+    3. Resample ke grid 5 menit yang tepat
+    4. Interpolasi linear untuk mengisi gap
+    
+    Contoh grid: 00:00, 00:05, 00:10, 00:15, ..., 23:55
     """
     if df.empty:
         return df
     
-    # Set timestamp sebagai index
     df = df.copy()
     df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+    
+    # Step 1: Normalisasi timestamp ke kelipatan 5 menit
+    df[timestamp_col] = df[timestamp_col].apply(_normalize_timestamp_to_5min)
+    
+    # Step 2: Hapus duplikat dengan mengambil rata-rata
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    df = df.groupby(timestamp_col)[numeric_cols].mean().reset_index()
+    
+    # Step 3: Set timestamp sebagai index
     df = df.set_index(timestamp_col)
     
-    # Resample ke 5 menit dan interpolasi
-    df_resampled = df.resample('5min').mean()
+    # Step 4: Tentukan range waktu
+    start_time = df.index.min()
+    end_time = df.index.max()
     
-    # Interpolasi linear untuk mengisi NaN
-    df_interpolated = df_resampled.interpolate(method='linear', limit_direction='both')
+    # Step 5: Buat grid 5 menit yang tepat
+    full_range = pd.date_range(start=start_time, end=end_time, freq='5min')
     
-    # Forward fill dan backward fill untuk sisa NaN
-    df_interpolated = df_interpolated.ffill().bfill()
+    # Step 6: Reindex ke grid yang tepat
+    df = df.reindex(full_range)
+    
+    # Step 7: Interpolasi linear untuk mengisi NaN (maks 6 slot = 30 menit gap)
+    df = df.interpolate(method='linear', limit_direction='both', limit=6)
+    
+    # Step 8: Forward fill dan backward fill untuk sisa NaN di ujung
+    df = df.ffill().bfill()
     
     # Reset index
-    df_interpolated = df_interpolated.reset_index()
+    df = df.reset_index()
+    df = df.rename(columns={'index': timestamp_col})
     
-    return df_interpolated
+    logging.info(f"Resample selesai: {len(df)} data points, range {start_time} - {end_time}")
+    
+    return df
 
 
 # =====================================================================
@@ -267,23 +393,86 @@ def _resample_and_interpolate(df: pd.DataFrame, timestamp_col: str = 'timestamp'
 # =====================================================================
 
 def _get_latest_weather_data(source: str) -> Optional[Any]:
-    """Ambil 1 data cuaca terkini untuk XGBoost."""
+    """Ambil 1 data cuaca terkini untuk XGBoost - load only needed columns."""
+    from .. import serializers
     try:
-        ModelClass = WeatherLogEcowitt if source == 'ecowitt' else WeatherLogWunderground
-        latest = db.session.query(ModelClass).order_by(ModelClass.id.desc()).first()
-        return latest
+        if source == 'ecowitt':
+            load_fields = [
+                WeatherLogEcowitt.id,
+                WeatherLogEcowitt.temperature_main_outdoor,
+                WeatherLogEcowitt.humidity_outdoor,
+                WeatherLogEcowitt.wind_speed,
+                WeatherLogEcowitt.wind_direction,
+                WeatherLogEcowitt.pressure_relative,
+                WeatherLogEcowitt.rain_rate,
+            ]
+        elif source == 'console':
+            load_fields = [
+                WeatherLogConsole.id,
+                WeatherLogConsole.temperature,
+                WeatherLogConsole.humidity,
+                WeatherLogConsole.wind_speed,
+                WeatherLogConsole.wind_direction,
+                WeatherLogConsole.pressure_relative,
+                WeatherLogConsole.rain_rate,
+            ]
+        else:
+            load_fields = [
+                WeatherLogWunderground.id,
+                WeatherLogWunderground.temperature,
+                WeatherLogWunderground.humidity,
+                WeatherLogWunderground.wind_speed,
+                WeatherLogWunderground.wind_direction,
+                WeatherLogWunderground.pressure,
+                WeatherLogWunderground.precipitation_rate,
+            ]
+        
+        return serializers.get_latest_weather_data(source, load_fields=load_fields)
     except Exception as e:
         logging.error(f"Error fetching latest {source} data: {e}")
         return None
 
 
 def _prepare_xgboost_features(weather_log, source: str) -> Optional[Dict[str, float]]:
-    """Menyiapkan fitur untuk prediksi XGBoost."""
+    """
+    Menyiapkan fitur untuk prediksi XGBoost.
+    
+    Fitur yang diperlukan (6 fitur):
+    1. suhu (°C)
+    2. kelembaban (%)
+    3. kecepatan_angin (m/s)
+    4. arah_angin (derajat)
+    5. tekanan_udara (hPa)
+    6. intensitas_hujan (mm/h)
+    
+    Berlaku sama untuk console, ecowitt, dan wunderground.
+    
+    Mapping kolom database:
+    - Console: temperature, humidity, wind_speed, wind_direction, pressure_relative, rain_rate
+    - Ecowitt: temperature_main_outdoor, humidity_outdoor, wind_speed, wind_direction, pressure_relative, rain_rate
+    - Wunderground: temperature, humidity, wind_speed, wind_direction, pressure, precipitation_rate
+    """
     if weather_log is None:
         return None
     
     try:
-        if source == 'ecowitt':
+        if source == 'console':
+            # Console Station - data dalam Imperial, konversi ke Metric untuk model
+            raw_temp = float(weather_log.temperature) if weather_log.temperature is not None else None
+            raw_wind = float(weather_log.wind_speed) if weather_log.wind_speed is not None else None
+            raw_pressure = float(weather_log.pressure_relative) if weather_log.pressure_relative is not None else None
+            raw_rain = float(weather_log.rain_rate) if weather_log.rain_rate is not None else 0.0
+            
+            features = {
+                'suhu': helpers.fahrenheit_to_celsius(raw_temp),  # °F → °C
+                'kelembaban': float(weather_log.humidity) if weather_log.humidity is not None else None,
+                'kecepatan_angin': helpers.mph_to_ms(raw_wind),  # mph → m/s
+                'arah_angin': float(weather_log.wind_direction) if weather_log.wind_direction is not None else None,
+                'tekanan_udara': helpers.inch_hg_to_hpa(raw_pressure),  # inHg → hPa
+                'intensitas_hujan': helpers.inch_per_hour_to_mm_per_hour(raw_rain) if raw_rain else 0.0,  # in/hr → mm/hr
+            }
+        elif source == 'ecowitt':
+            # Ecowitt - kolom: temperature_main_outdoor, humidity_outdoor
             features = {
                 'suhu': float(weather_log.temperature_main_outdoor) if weather_log.temperature_main_outdoor is not None else None,
                 'kelembaban': float(weather_log.humidity_outdoor) if weather_log.humidity_outdoor is not None else None,
@@ -293,6 +482,7 @@ def _prepare_xgboost_features(weather_log, source: str) -> Optional[Dict[str, fl
                 'intensitas_hujan': float(weather_log.rain_rate) if weather_log.rain_rate is not None else 0.0,
             }
         else:  # wunderground
+            # Wunderground - kolom: temperature, humidity, pressure, precipitation_rate
             features = {
                 'suhu': float(weather_log.temperature) if weather_log.temperature is not None else None,
                 'kelembaban': float(weather_log.humidity) if weather_log.humidity is not None else None,
@@ -302,30 +492,92 @@ def _prepare_xgboost_features(weather_log, source: str) -> Optional[Dict[str, fl
                 'intensitas_hujan': float(weather_log.precipitation_rate) if weather_log.precipitation_rate is not None else 0.0,
             }
         
-        # Validasi semua fitur ada
-        if any(v is None for k, v in features.items() if k != 'intensitas_hujan'):
-            logging.warning(f"Missing features for {source}: {features}")
+        # Validasi semua fitur ada (kecuali intensitas_hujan yang bisa 0)
+        missing_features = [k for k, v in features.items() if v is None and k != 'intensitas_hujan']
+        if missing_features:
+            logging.warning(f"[{source}] Missing XGBoost features: {missing_features}")
             return None
         
+        logging.debug(f"[{source}] XGBoost features: {features}")
         return features
+        
     except Exception as e:
         logging.error(f"Error preparing XGBoost features for {source}: {e}")
         return None
 
 
-def _fetch_lstm_data(source: str) -> Optional[pd.DataFrame]:
+def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
     """
     Ambil 144 data point terakhir (12 jam) untuk LSTM.
-    Cek interval waktu dan lakukan interpolasi jika diperlukan.
+    
+    Proses:
+    1. Query data dari database (dengan buffer)
+    2. Normalisasi timestamp ke kelipatan 5 menit (abaikan detik)
+    3. Cek apakah ada gap yang perlu interpolasi
+    4. Resample dan interpolasi jika diperlukan
+    5. Ambil 144 data terakhir
+    6. Hitung time features (hour_sin, hour_cos)
+    7. Return (DataFrame dengan 9 kolom, List[ID] dari database)
+    
+    Berlaku sama untuk console, ecowitt, dan wunderground.
+    
+    Returns:
+        Tuple[DataFrame, List[int]]: (data untuk LSTM, list ID dari database)
     """
     try:
-        ModelClass = WeatherLogEcowitt if source == 'ecowitt' else WeatherLogWunderground
+        if source == 'ecowitt':
+            ModelClass = WeatherLogEcowitt
+            order_column = ModelClass.request_time
+        elif source == 'console':
+            ModelClass = WeatherLogConsole
+            order_column = ModelClass.date_utc  # Console pakai date_utc
+        else:
+            ModelClass = WeatherLogWunderground
+            order_column = ModelClass.request_time
         
         # Ambil data lebih banyak untuk antisipasi gap
-        buffer_size = SEQUENCE_LENGTH + 50  # Lebih banyak untuk handle gaps
+        buffer_size = SEQUENCE_LENGTH + 100  # Lebih banyak untuk handle gaps
         
-        rows = db.session.query(ModelClass)\
-            .order_by(ModelClass.request_time.desc())\
+        # Load only columns needed for LSTM features
+        if source == 'ecowitt':
+            load_cols = load_only(
+                ModelClass.id,
+                ModelClass.request_time,
+                ModelClass.temperature_main_outdoor,
+                ModelClass.humidity_outdoor,
+                ModelClass.wind_speed,
+                ModelClass.wind_direction,
+                ModelClass.pressure_relative,
+                ModelClass.rain_rate,
+                ModelClass.solar_irradiance,
+            )
+        elif source == 'console':
+            load_cols = load_only(
+                ModelClass.id,
+                ModelClass.date_utc,
+                ModelClass.temperature,
+                ModelClass.humidity,
+                ModelClass.wind_speed,
+                ModelClass.wind_direction,
+                ModelClass.pressure_relative,
+                ModelClass.rain_rate,
+                ModelClass.solar_radiation,
+            )
+        else:  # wunderground
+            load_cols = load_only(
+                ModelClass.id,
+                ModelClass.request_time,
+                ModelClass.temperature,
+                ModelClass.humidity,
+                ModelClass.wind_speed,
+                ModelClass.wind_direction,
+                ModelClass.pressure,
+                ModelClass.precipitation_rate,
+                ModelClass.solar_radiation,
+            )
+        
+        rows = db.session.query(ModelClass).options(load_cols)\
+            .order_by(order_column.desc())\
             .limit(buffer_size)\
             .all()
         
@@ -336,23 +588,50 @@ def _fetch_lstm_data(source: str) -> Optional[pd.DataFrame]:
         # Reverse agar urut dari lama ke baru
         rows = list(reversed(rows))
         
+        # Simpan ID untuk referensi
+        row_ids = [row.id for row in rows]
+        
         # Konversi ke DataFrame
         data_list = []
-        timestamps = []
         
         for row in rows:
-            ts = row.request_time
+            # Console menggunakan date_utc, lainnya menggunakan request_time
+            if source == 'console':
+                ts = row.date_utc
+            else:
+                ts = row.request_time
+            
             if ts is None:
                 continue
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             
-            timestamps.append(ts)
+            # Normalisasi timestamp ke kelipatan 5 menit (abaikan detik)
+            ts_normalized = _normalize_timestamp_to_5min(ts)
             
-            if source == 'wunderground':
-                solar = (float(row.solar_radiation) * WM2_TO_LUX) if row.solar_radiation is not None else 0.0
+            if source == 'console':
+                # Console Station - data dalam Imperial, konversi ke Metric untuk model
+                raw_temp = float(row.temperature) if row.temperature is not None else np.nan
+                raw_wind = float(row.wind_speed) if row.wind_speed is not None else 0.0
+                raw_pressure = float(row.pressure_relative) if row.pressure_relative is not None else np.nan
+                raw_rain = float(row.rain_rate) if row.rain_rate is not None else 0.0
+                raw_solar = float(row.solar_radiation) if row.solar_radiation is not None else 0.0
+                
                 data_list.append({
-                    'timestamp': ts,
+                    'timestamp': ts_normalized,
+                    'suhu': helpers.fahrenheit_to_celsius(raw_temp) if not np.isnan(raw_temp) else np.nan,  # °F → °C
+                    'kelembaban': float(row.humidity) if row.humidity is not None else np.nan,
+                    'kecepatan_angin': helpers.mph_to_ms(raw_wind),  # mph → m/s
+                    'arah_angin': float(row.wind_direction) if row.wind_direction is not None else 0.0,
+                    'tekanan_udara': helpers.inch_hg_to_hpa(raw_pressure) if not np.isnan(raw_pressure) else np.nan,  # inHg → hPa
+                    'intensitas_hujan': helpers.inch_per_hour_to_mm_per_hour(raw_rain) if raw_rain else 0.0,  # in/hr → mm/hr
+                    'intensitas_cahaya': helpers.wm2_to_lux(raw_solar),  # W/m² → lux
+                })
+            elif source == 'wunderground':
+                # Wunderground - kolom: temperature, humidity, pressure, precipitation_rate
+                solar = helpers.wm2_to_lux(row.solar_radiation)
+                data_list.append({
+                    'timestamp': ts_normalized,
                     'suhu': float(row.temperature) if row.temperature is not None else np.nan,
                     'kelembaban': float(row.humidity) if row.humidity is not None else np.nan,
                     'kecepatan_angin': float(row.wind_speed) if row.wind_speed is not None else 0.0,
@@ -362,42 +641,68 @@ def _fetch_lstm_data(source: str) -> Optional[pd.DataFrame]:
                     'intensitas_cahaya': solar,
                 })
             else:  # ecowitt
+                # Ecowitt - kolom: temperature_main_outdoor, humidity_outdoor
+                # solar_irradiance sudah dalam lux (tidak perlu konversi)
+                solar = float(row.solar_irradiance) if row.solar_irradiance is not None else 0.0
                 data_list.append({
-                    'timestamp': ts,
+                    'timestamp': ts_normalized,
                     'suhu': float(row.temperature_main_outdoor) if row.temperature_main_outdoor is not None else np.nan,
                     'kelembaban': float(row.humidity_outdoor) if row.humidity_outdoor is not None else np.nan,
                     'kecepatan_angin': float(row.wind_speed) if row.wind_speed is not None else 0.0,
                     'arah_angin': float(row.wind_direction) if row.wind_direction is not None else 0.0,
                     'tekanan_udara': float(row.pressure_relative) if row.pressure_relative is not None else np.nan,
                     'intensitas_hujan': float(row.rain_rate) if row.rain_rate is not None else 0.0,
-                    'intensitas_cahaya': float(row.solar_irradiance) if row.solar_irradiance is not None else 0.0,
+                    'intensitas_cahaya': solar,
                 })
         
         if len(data_list) < SEQUENCE_LENGTH:
-            logging.warning(f"Data tidak cukup setelah parsing untuk {source}")
+            logging.warning(f"Data tidak cukup setelah parsing untuk {source}: {len(data_list)}")
             return None
         
         df = pd.DataFrame(data_list)
         
-        # Cek apakah perlu interpolasi
+        logging.info(f"[{source}] Data awal: {len(df)} rows, range: {df['timestamp'].min()} - {df['timestamp'].max()}")
+        
+        # Ambil timestamps untuk cek interpolasi (sudah dinormalisasi)
+        timestamps = df['timestamp'].tolist()
         needs_interpolation = _check_data_needs_interpolation(timestamps)
         
         if needs_interpolation:
-            logging.info(f"Data {source} memerlukan interpolasi karena ada gap")
+            logging.info(f"[{source}] Data memerlukan interpolasi (ada gap atau duplikat)")
+            original_count = len(df)
             df = _resample_and_interpolate(df, 'timestamp')
+            post_resample_count = len(df)
+            interpolated_count = max(0, post_resample_count - original_count)
+            
+            if interpolated_count > 0:
+                ratio = interpolated_count / post_resample_count
+                if ratio > MAX_INTERPOLATED_RATIO:
+                    logging.warning(
+                        f"[{source}] Rasio interpolasi terlalu tinggi: "
+                        f"{interpolated_count}/{post_resample_count} ({ratio:.0%}). "
+                        f"LSTM dibatalkan untuk source ini."
+                    )
+                    return None
+                logging.info(f"[{source}] Interpolasi OK: {interpolated_count} baris baru ({ratio:.0%})")
         else:
-            logging.info(f"Data {source} sudah rapi, skip interpolasi")
+            logging.info(f"[{source}] Data sudah rapi (interval 5 menit tepat)")
         
         # Ambil 144 data terakhir
         if len(df) > SEQUENCE_LENGTH:
-            df = df.tail(SEQUENCE_LENGTH)
+            df = df.tail(SEQUENCE_LENGTH).reset_index(drop=True)
         
         if len(df) < SEQUENCE_LENGTH:
-            logging.warning(f"Data kurang dari {SEQUENCE_LENGTH} setelah processing untuk {source}")
+            logging.warning(f"[{source}] Data kurang dari {SEQUENCE_LENGTH} setelah processing: {len(df)}")
             return None
         
+        logging.info(f"[{source}] Data final: {len(df)} rows")
+        
         # Imputation untuk NaN yang tersisa
-        df = df.ffill().bfill()
+        numeric_cols = ['suhu', 'kelembaban', 'kecepatan_angin', 'arah_angin', 
+                       'tekanan_udara', 'intensitas_hujan', 'intensitas_cahaya']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = df[col].ffill().bfill().fillna(0)
         
         # Hitung time features (Sin/Cos)
         if 'timestamp' in df.columns:
@@ -422,7 +727,10 @@ def _fetch_lstm_data(source: str) -> Optional[pd.DataFrame]:
             logging.warning(f"Data masih mengandung NaN setelah imputasi pada {source}")
             final_df = final_df.ffill().bfill().fillna(0)
         
-        return final_df
+        # Ambil 144 ID terakhir untuk referensi
+        final_ids = row_ids[-SEQUENCE_LENGTH:] if len(row_ids) >= SEQUENCE_LENGTH else row_ids
+        
+        return (final_df, final_ids)
         
     except Exception as e:
         logging.error(f"Error fetching LSTM data for {source}: {e}")
@@ -433,8 +741,9 @@ def _fetch_lstm_data(source: str) -> Optional[pd.DataFrame]:
 # PREDICTION FUNCTIONS
 # =====================================================================
 
-def predict_xgboost(features: Dict[str, float]) -> Optional[int]:
+def predict_xgboost(features: Dict[str, float], source: str) -> Optional[int]:
     """Jalankan prediksi XGBoost dan return class label (int)."""
+    logging.info(f"Melakukan prediksi cuaca untuk {source} (XGBoost)...")
     loader = get_model_loader()
     
     if loader.xgboost_model is None:
@@ -448,24 +757,52 @@ def predict_xgboost(features: Dict[str, float]) -> Optional[int]:
             logging.error(f"Missing XGBoost features: {missing}")
             return None
         
-        # Buat DataFrame
+        # Buat DataFrame dengan feature names
         input_df = pd.DataFrame([features], columns=XGBOOST_REQUIRED_FEATURES)
         input_df = input_df.astype(float)
         
-        # Prediksi
-        prediction_raw = loader.xgboost_model.predict(input_df)
-        result = int(prediction_raw[0])
+        # Prediksi — gunakan DMatrix untuk handling version-mismatch
+        # Model diserialisasi via joblib oleh XGBoost versi lama. XGBoost 3.x
+        # internal booster tidak menyimpan feature names, menyebabkan
+        # validate_features gagal meskipun DataFrame benar. Solusi: buat
+        # DMatrix secara eksplisit dengan feature_names.
+        import xgboost as xgb
+        dmatrix = xgb.DMatrix(input_df, feature_names=XGBOOST_REQUIRED_FEATURES)
+        booster = loader.xgboost_model.get_booster()
+        prediction_raw = booster.predict(dmatrix)
         
-        logging.info(f"XGBoost prediction: {result} ({LABEL_MAP.get(result, 'Unknown')})")
+        # XGBClassifier multi-class: output berupa probabilitas per kelas
+        # Ambil kelas dengan probabilitas tertinggi
+        import numpy as np
+        if prediction_raw.ndim == 2:
+            result = int(np.argmax(prediction_raw[0]))
+        else:
+            result = int(prediction_raw[0])
+        
+        logging.info(f"XGBoost prediction for {source.capitalize()}: {result} ({LABEL_MAP.get(result, 'Unknown')})")
         return result
         
     except Exception as e:
-        logging.error(f"Error in XGBoost prediction: {e}")
+        logging.error(f"Error in XGBoost prediction for {source}: {e}")
         return None
 
 
-def predict_lstm(data: pd.DataFrame) -> Optional[List[float]]:
-    """Jalankan prediksi LSTM dan return array 24 nilai (intensitas hujan per jam)."""
+def predict_lstm(data: pd.DataFrame, source: str) -> Optional[List[float]]:
+    """
+    Jalankan prediksi LSTM dan return array 24 nilai (intensitas hujan per jam).
+    
+    Proses:
+    1. Validasi shape data (144, 9)
+    2. Scaling menggunakan MinMaxScaler yang sudah di-fit
+    3. Reshape untuk input LSTM (1, 144, 9)
+    4. Prediksi menghasilkan (1, 24) - scaled values
+    5. Inverse scaling untuk mendapat nilai mm/h asli
+    
+    Formula MinMaxScaler:
+    - Scaling:   X_scaled = X * scale_ + min_
+    - Inverse:   X = (X_scaled - min_) / scale_
+    """
+    logging.info(f"Melakukan prediksi cuaca untuk {source} (LSTM)...")
     loader = get_model_loader()
     
     if loader.lstm_model is None or loader.scaler is None:
@@ -474,176 +811,392 @@ def predict_lstm(data: pd.DataFrame) -> Optional[List[float]]:
     
     try:
         # Konversi ke numpy array
-        raw_data = data.values
+        raw_data = data.values.astype(np.float64)
         
         if raw_data.shape != (SEQUENCE_LENGTH, N_FEATURES):
             logging.error(f"Invalid data shape: {raw_data.shape}, expected ({SEQUENCE_LENGTH}, {N_FEATURES})")
             return None
         
-        # Scaling
+        # Log statistik input sebelum scaling
+        logging.debug(f"Input stats before scaling - mean: {raw_data.mean(axis=0)}, std: {raw_data.std(axis=0)}")
+        
+        # Scaling menggunakan scaler yang sudah di-fit
         scaled_data = loader.scaler.transform(raw_data)
+        
+        # Log statistik setelah scaling
+        logging.debug(f"Scaled stats - min: {scaled_data.min()}, max: {scaled_data.max()}")
         
         # Reshape untuk LSTM: (batch, steps, features) -> (1, 144, 9)
         input_tensor = scaled_data.reshape(1, SEQUENCE_LENGTH, N_FEATURES)
         
-        # Prediksi
-        pred_scaled = loader.lstm_model.predict(input_tensor, verbose=0)
+        # Prediksi - output adalah scaled values (thread-safe via Lock eksplisit)
+        with _lstm_predict_lock:
+            pred_scaled = loader.lstm_model.predict(input_tensor, verbose=0)
         
-        # Inverse scaling khusus untuk fitur hujan
+        logging.debug(f"Raw prediction (scaled): min={pred_scaled.min():.4f}, max={pred_scaled.max():.4f}")
+        
+        # Inverse scaling khusus untuk fitur hujan (index 5)
         scale_val, min_val = loader.get_rain_inverse_params()
+        
         if scale_val is None or min_val is None:
-            logging.warning("Tidak bisa melakukan inverse scaling")
+            logging.warning("Tidak bisa melakukan inverse scaling - return raw prediction")
             return pred_scaled.flatten().tolist()
         
-        # Rumus Inverse MinMaxScaler: (X_scaled - min_) / scale_
-        pred_mm = (pred_scaled - min_val) / scale_val
+        logging.debug(f"Inverse params - scale: {scale_val}, min: {min_val}")
         
-        # Bersihkan nilai negatif dan bulatkan
-        pred_final = np.maximum(pred_mm, 0.0).flatten().tolist()
-        final_rounded = [round(x, 2) for x in pred_final]
+        # Rumus Inverse MinMaxScaler: X = (X_scaled - min_) / scale_
+        pred_unscaled = (pred_scaled - min_val) / scale_val
         
-        logging.info(f"LSTM prediction (24 hours): {final_rounded[:5]}... (showing first 5)")
+        logging.debug(f"After inverse scaling: min={pred_unscaled.min():.4f}, max={pred_unscaled.max():.4f}")
+        
+        # Bersihkan nilai negatif (hujan tidak bisa negatif)
+        pred_final = np.maximum(pred_unscaled, 0.0).flatten()
+        
+        # Bulatkan ke 2 desimal
+        final_rounded = [round(float(x), 2) for x in pred_final]
+        
+        logging.info(f"LSTM prediction for {source.capitalize()} (24 hours): {final_rounded}")
         return final_rounded
         
     except Exception as e:
-        logging.error(f"Error in LSTM prediction: {e}")
+        logging.error(f"Error in LSTM prediction for {source}: {e}")
+        import traceback
+        logging.debug(traceback.format_exc())
         return None
+
+
+# =====================================================================
+# PARALLEL SOURCE PROCESSING
+# =====================================================================
+
+def _process_source(source: str, app) -> SourceResult:
+    """
+    Process single source: XGBoost → LSTM (sequential within thread).
+    Dijalankan dalam thread terpisah (parallel antar sumber).
+    
+    Args:
+        source: 'console', 'ecowitt', atau 'wunderground'
+        app: Flask app object untuk app_context
+    
+    Returns:
+        SourceResult dengan hasil XGBoost dan LSTM (atau error messages)
+    """
+    result = SourceResult(source=source)
+    
+    try:
+        with app.app_context():
+            # 1. Get latest weather data (1 data untuk XGBoost)
+            weather = _get_latest_weather_data(source)
+            if not weather:
+                result.xgboost_error = f"No data available for {source}"
+                result.lstm_error = f"No data available for {source}"
+                logging.warning(f"[{source}] No weather data available")
+                return result
+            
+            result.weather_id = weather.id
+            logging.info(f"[{source}] Processing weather_id={weather.id}")
+            
+            # 2. XGBoost prediction (FIRST)
+            try:
+                features = _prepare_xgboost_features(weather, source)
+                if features:
+                    result.xgboost = predict_xgboost(features, source)
+                    logging.info(f"[{source}] XGBoost: class {result.xgboost}")
+                else:
+                    result.xgboost_error = "Failed to prepare XGBoost features"
+                    logging.warning(f"[{source}] XGBoost: feature preparation failed")
+            except Exception as e:
+                result.xgboost_error = str(e)
+                logging.error(f"[{source}] XGBoost failed: {e}")
+            
+            # 3. LSTM prediction (SECOND, regardless of XGBoost result)
+            try:
+                lstm_data = _fetch_lstm_data(source)
+                if lstm_data:
+                    df, ids = lstm_data
+                    result.lstm = predict_lstm(df, source)
+                    result.lstm_ids = ids
+                    logging.info(f"[{source}] LSTM: {len(result.lstm) if result.lstm else 0} values using {len(ids) if ids else 0} data points")
+                else:
+                    result.lstm_error = "Insufficient data for LSTM (need 144 points)"
+                    logging.warning(f"[{source}] LSTM: insufficient data")
+            except Exception as e:
+                result.lstm_error = str(e)
+                logging.error(f"[{source}] LSTM failed: {e}")
+                
+    except Exception as e:
+        result.xgboost_error = str(e)
+        result.lstm_error = str(e)
+        logging.error(f"[{source}] Critical failure: {e}")
+    
+    return result
 
 
 # =====================================================================
 # MAIN PREDICTION PIPELINE
 # =====================================================================
 
-def run_prediction_pipeline() -> Optional[PredictionLog]:
+def run_prediction_pipeline(skip_sources: list = None) -> Optional[PredictionLog]:
     """
-    Menjalankan pipeline prediksi lengkap:
-    1. Step A (Ecowitt): XGBoost + LSTM
-    2. Step B (Wunderground): XGBoost + LSTM
-    3. Step C (Save): Simpan ke satu baris PredictionLog
+    Menjalankan pipeline prediksi dengan parallel processing per sumber.
     
-    Returns PredictionLog yang tersimpan, atau None jika gagal.
+    Args:
+        skip_sources: List source yang di-skip karena fetch gagal.
+                      Contoh: ['wunderground'] jika Wunderground fetch gagal.
+                      None = proses semua source (default, dipakai safety net).
+    
+    Features:
+    - Parallel: sumber diproses bersamaan
+    - Sequential: XGBoost → LSTM dalam tiap thread
+    - Partial Save: Simpan XGBoost jika berhasil, simpan LSTM jika berhasil
+    - Error Isolation: Error satu sumber tidak mempengaruhi lainnya
+    - Timeout: 60 detik per sumber
+    
+    Returns:
+        PredictionLog terakhir yang tersimpan, atau None jika gagal total.
     """
-    logging.info("="*60)
-    logging.info("Memulai Prediction Pipeline")
-    logging.info("="*60)
+    logging.info("=" * 60)
+    logging.info("[PREDIKSI] Memulai Parallel Prediction Pipeline")
+    
+    # Tentukan source yang akan diproses (filter yang gagal fetch)
+    all_sources = ['console', 'ecowitt', 'wunderground']
+    if skip_sources:
+        sources = [s for s in all_sources if s not in skip_sources]
+        skipped = [s for s in all_sources if s in skip_sources]
+        if skipped:
+            logging.warning(f"[PREDIKSI] Source di-SKIP (fetch gagal): {skipped}")
+    else:
+        sources = all_sources
+    
+    if not sources:
+        logging.warning("[PREDIKSI] Semua source di-skip. Pipeline DIBATALKAN.")
+        return None
+    
+    logging.info(f"[PREDIKSI] Mode: {len(sources)} threads parallel, XGBoost->LSTM sequential per thread")
+    logging.info(f"[PREDIKSI] Sources: {sources}")
+    logging.info("=" * 60)
     
     # Inisialisasi model jika belum
     initialize_models()
     
-    # Container untuk hasil sementara
+    # Get Flask app untuk app_context di thread
+    app = current_app._get_current_object()
+    source_results: Dict[str, SourceResult] = {}
+    
+    # =========================================================================
+    # STEP 1: PARALLEL PROCESSING (3 threads)
+    # =========================================================================
+    TIMEOUT_SECONDS = 60
+    
+    logging.info("-" * 40)
+    logging.info("Step 1: Parallel processing (3 sources)")
+    logging.info("-" * 40)
+    
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix='predict') as executor:
+        # Submit semua task
+        future_to_source = {
+            executor.submit(_process_source, src, app): src
+            for src in sources
+        }
+        
+        # Collect results
+        for future in as_completed(future_to_source, timeout=TIMEOUT_SECONDS + 10):
+            source = future_to_source[future]
+            try:
+                result = future.result(timeout=TIMEOUT_SECONDS)
+                source_results[source] = result
+                
+                xgb_status = f"class {result.xgboost}" if result.xgboost is not None else "FAILED"
+                lstm_status = f"{len(result.lstm)} vals" if result.lstm else "FAILED"
+                logging.info(f"[{source}] Completed - XGBoost: {xgb_status}, LSTM: {lstm_status}")
+                
+            except FuturesTimeoutError:
+                source_results[source] = SourceResult(
+                    source=source, 
+                    xgboost_error="Timeout", 
+                    lstm_error="Timeout"
+                )
+                logging.error(f"[{source}] Timeout after {TIMEOUT_SECONDS}s")
+            except Exception as e:
+                source_results[source] = SourceResult(
+                    source=source, 
+                    xgboost_error=str(e), 
+                    lstm_error=str(e)
+                )
+                logging.error(f"[{source}] Exception: {e}")
+    
+    # =========================================================================
+    # STEP 2: AGGREGATE RESULTS
+    # =========================================================================
+    logging.info("-" * 40)
+    logging.info("Step 2: Aggregating results")
+    logging.info("-" * 40)
+    
+    # Helper untuk mendapatkan SourceResult dengan default
+    def get_result(src: str) -> SourceResult:
+        return source_results.get(src, SourceResult(source=src))
+    
     results = {
-        'ecowitt_xgboost': None,
-        'ecowitt_lstm': None,
-        'ecowitt_weather_id': None,
-        'wunderground_xgboost': None,
-        'wunderground_lstm': None,
-        'wunderground_weather_id': None,
+        'console_weather_id': get_result('console').weather_id,
+        'console_xgboost': get_result('console').xgboost,
+        'console_lstm': get_result('console').lstm,
+        'console_lstm_ids': get_result('console').lstm_ids,
+        'ecowitt_weather_id': get_result('ecowitt').weather_id,
+        'ecowitt_xgboost': get_result('ecowitt').xgboost,
+        'ecowitt_lstm': get_result('ecowitt').lstm,
+        'ecowitt_lstm_ids': get_result('ecowitt').lstm_ids,
+        'wunderground_weather_id': get_result('wunderground').weather_id,
+        'wunderground_xgboost': get_result('wunderground').xgboost,
+        'wunderground_lstm': get_result('wunderground').lstm,
+        'wunderground_lstm_ids': get_result('wunderground').lstm_ids,
     }
     
-    # -------------------------
-    # Step A: Ecowitt
-    # -------------------------
+    # =========================================================================
+    # STEP 3: PARTIAL SAVE LOGIC
+    # =========================================================================
     logging.info("-" * 40)
-    logging.info("Step A: Processing Ecowitt")
-    logging.info("-" * 40)
-    
-    eco_weather = _get_latest_weather_data('ecowitt')
-    if eco_weather:
-        results['ecowitt_weather_id'] = eco_weather.id
-        
-        # XGBoost
-        eco_features = _prepare_xgboost_features(eco_weather, 'ecowitt')
-        if eco_features:
-            results['ecowitt_xgboost'] = predict_xgboost(eco_features)
-        
-        # LSTM
-        eco_lstm_data = _fetch_lstm_data('ecowitt')
-        if eco_lstm_data is not None:
-            results['ecowitt_lstm'] = predict_lstm(eco_lstm_data)
-    else:
-        logging.warning("Tidak ada data Ecowitt tersedia")
-    
-    # -------------------------
-    # Step B: Wunderground
-    # -------------------------
-    logging.info("-" * 40)
-    logging.info("Step B: Processing Wunderground")
+    logging.info("Step 3: Saving to database (partial save)")
     logging.info("-" * 40)
     
-    wu_weather = _get_latest_weather_data('wunderground')
-    if wu_weather:
-        results['wunderground_weather_id'] = wu_weather.id
-        
-        # XGBoost
-        wu_features = _prepare_xgboost_features(wu_weather, 'wunderground')
-        if wu_features:
-            results['wunderground_xgboost'] = predict_xgboost(wu_features)
-        
-        # LSTM
-        wu_lstm_data = _fetch_lstm_data('wunderground')
-        if wu_lstm_data is not None:
-            results['wunderground_lstm'] = predict_lstm(wu_lstm_data)
-    else:
-        logging.warning("Tidak ada data Wunderground tersedia")
+    # Cek hasil XGBoost (minimal 1 sumber berhasil)
+    has_xgboost_results = any([
+        results['console_xgboost'] is not None,
+        results['ecowitt_xgboost'] is not None,
+        results['wunderground_xgboost'] is not None,
+    ])
     
-    # -------------------------
-    # Step C: Save to Database
-    # -------------------------
-    logging.info("-" * 40)
-    logging.info("Step C: Saving to Database")
-    logging.info("-" * 40)
+    # Cek hasil LSTM (minimal 1 sumber berhasil)
+    has_lstm_results = any([
+        results['console_lstm'] is not None,
+        results['ecowitt_lstm'] is not None,
+        results['wunderground_lstm'] is not None,
+    ])
     
-    # Cek apakah ada data untuk disimpan
-    has_ecowitt = results['ecowitt_weather_id'] is not None
-    has_wunderground = results['wunderground_weather_id'] is not None
-    
-    if not has_ecowitt and not has_wunderground:
-        logging.warning("Tidak ada data dari kedua sumber. Pipeline dibatalkan.")
+    if not has_xgboost_results and not has_lstm_results:
+        logging.warning("[PREDIKSI] Tidak ada hasil dari kedua model. Pipeline dibatalkan.")
         return None
     
-    # Ambil model metadata dari database
-    xgboost_model = db.session.query(ModelMeta).filter(
-        ModelMeta.name.ilike('%xgboost%')
-    ).first()
+    logging.info(f"[PREDIKSI] Has XGBoost results: {has_xgboost_results}")
+    logging.info(f"[PREDIKSI] Has LSTM results: {has_lstm_results}")
     
-    lstm_model = db.session.query(ModelMeta).filter(
-        ModelMeta.name.ilike('%lstm%')
+    # Ambil model metadata - gunakan exact match untuk efisiensi (avoid ILIKE)
+    xgboost_model_meta = db.session.query(ModelMeta).options(
+        load_only(ModelMeta.id, ModelMeta.name)
+    ).filter(
+        ModelMeta.name == 'default_xgboost'
     ).first()
-    
-    # Jika tidak ada model spesifik, gunakan model pertama
-    if not xgboost_model:
-        xgboost_model = db.session.query(ModelMeta).first()
-    if not lstm_model:
-        lstm_model = db.session.query(ModelMeta).first()
+    lstm_model_meta = db.session.query(ModelMeta).options(
+        load_only(ModelMeta.id, ModelMeta.name)
+    ).filter(
+        ModelMeta.name == 'default_lstm'
+    ).first()
     
     try:
-        # Buat PredictionLog baru dengan 10 kolom
-        prediction_log = PredictionLog(
-            weather_log_ecowitt_id=results['ecowitt_weather_id'],
-            weather_log_wunderground_id=results['wunderground_weather_id'],
-            xgboost_model_id=xgboost_model.id if xgboost_model else None,
-            lstm_model_id=lstm_model.id if lstm_model else None,
-            ecowitt_predict_result=results['ecowitt_xgboost'],
-            wunderground_predict_result=results['wunderground_xgboost'],
-            ecowitt_predict_data=results['ecowitt_lstm'],
-            wunderground_predict_data=results['wunderground_lstm'],
-        )
+        prediction_logs = []
         
-        db.session.add(prediction_log)
+        # Gunakan satu timestamp yang sama untuk semua log dalam batch ini
+        # Ini PENTING agar serializers.py bisa mem-pairing XGBoost dan LSTM berdasarkan created_at
+        prediction_timestamp = datetime.now(timezone.utc)
+        
+        # ---------------------------------------------------------------------
+        # SAVE XGBOOST (jika ada hasil)
+        # ---------------------------------------------------------------------
+        if has_xgboost_results:
+            # DataXGBoost: referensi 1 ID per sumber yang berhasil
+            data_xgboost = DataXGBoost(
+                weather_log_console_id=results['console_weather_id'] if results['console_xgboost'] is not None else None,
+                weather_log_ecowitt_id=results['ecowitt_weather_id'] if results['ecowitt_xgboost'] is not None else None,
+                weather_log_wunderground_id=results['wunderground_weather_id'] if results['wunderground_xgboost'] is not None else None,
+            )
+            db.session.add(data_xgboost)
+            db.session.flush()
+            
+            # XGBoostPredictionResult: konversi class_id ke label_id
+            def _class_to_label_id(class_id: int) -> int:
+                if class_id is None:
+                    return None
+                return class_id + 1  # label.id dimulai dari 1
+            
+            xgboost_result = XGBoostPredictionResult(
+                console_result_id=_class_to_label_id(results['console_xgboost']),
+                ecowitt_result_id=_class_to_label_id(results['ecowitt_xgboost']),
+                wunderground_result_id=_class_to_label_id(results['wunderground_xgboost']),
+            )
+            db.session.add(xgboost_result)
+            db.session.flush()
+            
+            # PredictionLog untuk XGBoost
+            pl_xgboost = PredictionLog(
+                model_id=xgboost_model_meta.id if xgboost_model_meta else None,
+                data_xgboost_id=data_xgboost.id,
+                data_lstm_id=None,  # NULL karena ini XGBoost
+                xgboost_result_id=xgboost_result.id,
+                lstm_result_id=None,  # NULL karena ini XGBoost
+                created_at=prediction_timestamp,  # Explicit sync
+            )
+            db.session.add(pl_xgboost)
+            prediction_logs.append(('XGBoost', pl_xgboost, data_xgboost, xgboost_result))
+            
+            logging.info(f"[PREDIKSI] XGBoost data prepared (DataXGBoost ID: {data_xgboost.id})")
+        
+        # ---------------------------------------------------------------------
+        # SAVE LSTM (jika ada hasil)
+        # ---------------------------------------------------------------------
+        if has_lstm_results:
+            # DataLSTM: referensi 144 IDs per sumber yang berhasil (sebagai array)
+            data_lstm = DataLSTM(
+                weather_log_console_ids=results['console_lstm_ids'] if results['console_lstm'] is not None else None,
+                weather_log_ecowitt_ids=results['ecowitt_lstm_ids'] if results['ecowitt_lstm'] is not None else None,
+                weather_log_wunderground_ids=results['wunderground_lstm_ids'] if results['wunderground_lstm'] is not None else None,
+            )
+            db.session.add(data_lstm)
+            db.session.flush()
+            
+            # LSTMPredictionResult: array 24 float per sumber
+            lstm_result = LSTMPredictionResult(
+                console_result=results['console_lstm'],
+                ecowitt_result=results['ecowitt_lstm'],
+                wunderground_result=results['wunderground_lstm'],
+            )
+            db.session.add(lstm_result)
+            db.session.flush()
+            
+            # PredictionLog untuk LSTM
+            pl_lstm = PredictionLog(
+                model_id=lstm_model_meta.id if lstm_model_meta else None,
+                data_xgboost_id=None,  # NULL karena ini LSTM
+                data_lstm_id=data_lstm.id,
+                xgboost_result_id=None,  # NULL karena ini LSTM
+                lstm_result_id=lstm_result.id,
+                created_at=prediction_timestamp,  # Explicit sync
+            )
+            db.session.add(pl_lstm)
+            prediction_logs.append(('LSTM', pl_lstm, data_lstm, lstm_result))
+            
+            logging.info(f"[PREDIKSI] LSTM data prepared (DataLSTM ID: {data_lstm.id})")
+        
+        # ---------------------------------------------------------------------
+        # COMMIT ATOMIC
+        # ---------------------------------------------------------------------
         db.session.commit()
         
-        logging.info(f"PredictionLog berhasil disimpan dengan ID: {prediction_log.id}")
-        logging.info(f"  - Ecowitt XGBoost: {results['ecowitt_xgboost']}")
-        logging.info(f"  - Ecowitt LSTM: {len(results['ecowitt_lstm']) if results['ecowitt_lstm'] else 0} values")
-        logging.info(f"  - Wunderground XGBoost: {results['wunderground_xgboost']}")
-        logging.info(f"  - Wunderground LSTM: {len(results['wunderground_lstm']) if results['wunderground_lstm'] else 0} values")
-        logging.info("="*60)
+        # Log hasil
+        logging.info("=" * 60)
+        logging.info("[PREDIKSI] Pipeline completed successfully!")
+        for model_type, pl, data_obj, result_obj in prediction_logs:
+            logging.info(f"  - PredictionLog {model_type}: ID={pl.id}")
+        logging.info("=" * 60)
         
-        return prediction_log
+        # Return PredictionLog terakhir (LSTM jika ada, XGBoost jika tidak)
+        if prediction_logs:
+            return prediction_logs[-1][1]
+        return None
         
     except Exception as e:
-        logging.error(f"Error saving PredictionLog: {e}")
+        logging.error(f"[PREDIKSI] Error saving prediction results: {e}")
         db.session.rollback()
+        import traceback
+        logging.debug(traceback.format_exc())
         return None
 
 
@@ -656,12 +1209,10 @@ def get_label_name(class_id: int) -> str:
     Karena XGBoost dilatih dengan class_id 0-8 (sesuai LABEL_MAP), kita gunakan class_id + 1
     untuk mengambil dari database (karena ID database dimulai dari 1).
     """
-    from ..models import Label
-    
     try:
-        # XGBoost class_id 0 = label.id 1, class_id 1 = label.id 2, dst.
-        # Kita query berdasarkan ID = class_id + 1
-        label = Label.query.filter_by(id=class_id + 1).first()
+        # Gunakan Session.get() untuk PK lookup — memanfaatkan identity map cache
+        # sehingga tidak mengirim query SQL jika objek sudah ada di session
+        label = db.session.get(Label, class_id + 1)
         if label:
             return label.name
     except Exception:
@@ -676,11 +1227,9 @@ def get_label_from_db(class_id: int) -> dict:
     Mendapatkan label lengkap dari database.
     Returns dict dengan id, name, dan class_id (original dari XGBoost).
     """
-    from ..models import Label
-    
     try:
-        # class_id dari XGBoost (0-8), label.id di database (1-9)
-        label = Label.query.filter_by(id=class_id + 1).first()
+        # Gunakan Session.get() untuk PK lookup — memanfaatkan identity map cache
+        label = db.session.get(Label, class_id + 1)
         if label:
             return {
                 'label_id': label.id,
@@ -703,11 +1252,11 @@ def get_model_info(model_type: str) -> dict:
     Mendapatkan informasi model dari database.
     model_type: 'xgboost' atau 'lstm'
     """
-    from ..models import Model as ModelMeta
-    
     try:
-        model = ModelMeta.query.filter(
-            ModelMeta.name.ilike(f'%{model_type}%')
+        model = db.session.query(ModelMeta).options(
+            load_only(ModelMeta.id, ModelMeta.name, ModelMeta.range_prediction)
+        ).filter(
+            ModelMeta.name == f'default_{model_type}'
         ).first()
         
         if model:

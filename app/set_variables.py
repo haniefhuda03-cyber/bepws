@@ -1,7 +1,11 @@
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# =====================================================
+# CATATAN: .env dimuat oleh app/__init__.py (create_app)
+# berdasarkan kondisi LOAD_DOTENV / FLASK_ENV.
+# Jangan panggil load_dotenv() di sini agar tidak
+# override variabel dari systemd/Docker di production.
+# =====================================================
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
@@ -17,4 +21,4 @@ ECO_MAC = os.environ.get('ECO_MAC')
 
 WUNDERGROUND_URL = os.environ.get('WUNDERGROUND_URL')
 
-API_READ_KEY = os.environ.get('API_READ_KEY')
+APPKEY = os.environ.get('APPKEY')

@@ -8,8 +8,9 @@ Backend API untuk sistem prediksi cuaca menggunakan LSTM dan XGBoost.
 
 ### Prasyarat
 - Python 3.10+ 
-- MySQL Server (running)
+- PostgreSQL Server (running)
 - Git
+- Redis *(opsional — jika tidak ada, cache fallback ke in-memory)*
 
 ---
 
@@ -17,7 +18,7 @@ Backend API untuk sistem prediksi cuaca menggunakan LSTM dan XGBoost.
 
 ### Step 1: Clone & Masuk Direktori
 ```bash
-cd tuwsbe
+cd tuwsbe-fix
 ```
 
 ### Step 2: Buat Virtual Environment
@@ -36,52 +37,85 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Step 4: Buat Database MySQL
+### Step 4: Buat Database PostgreSQL
 ```sql
--- Login ke MySQL
-mysql -u root -p
+-- Login ke PostgreSQL
+psql -U postgres
 
 -- Buat database
-CREATE DATABASE tuws_pws CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE tuws_pws;
 
 -- (Opsional) Buat user khusus
-CREATE USER 'tuws_user'@'localhost' IDENTIFIED BY 'password123';
-GRANT ALL PRIVILEGES ON tuws_pws.* TO 'tuws_user'@'localhost';
-FLUSH PRIVILEGES;
+CREATE USER tuws_user WITH PASSWORD 'password123';
+GRANT ALL PRIVILEGES ON DATABASE tuws_pws TO tuws_user;
 
-EXIT;
+\q
 ```
 
 ### Step 5: Konfigurasi Environment (.env)
-```bash
-# Copy contoh atau edit langsung .env
-```
+
+File `.env` di-load **otomatis** saat aplikasi startup. Tidak perlu set environment variable apapun untuk loading-nya.
 
 Isi file `.env`:
 ```dotenv
-# Database (sesuaikan dengan MySQL Anda)
-DATABASE_URL="mysql+pymysql://root@localhost:3306/tuws_pws"
+# ============================================================
+# DATABASE
+# ============================================================
+DATABASE_URL="postgresql://postgres@localhost:5432/tuws_pws"
 # atau dengan password:
-# DATABASE_URL="mysql+pymysql://root:password@localhost:3306/tuws_pws"
+# DATABASE_URL="postgresql://postgres:password@localhost:5432/tuws_pws"
 
-# Flask
+# ============================================================
+# FLASK
+# ============================================================
 FLASK_APP=run.py
 FLASK_ENV=development
 FLASK_DEBUG=1
 FLASK_HOST=127.0.0.1
 FLASK_PORT=5000
 
-# Secret Key (generate random)
+# ============================================================
+# KEAMANAN
+# ============================================================
+# Secret Key (generate random, untuk session & CSRF)
 SECRET_KEY="your-random-secret-key-here"
 
-# API Key untuk akses endpoint
+# API Key untuk akses endpoint v3 (header X-APP-KEY)
 API_READ_KEY="tuws2526"
 
-# Weather API Keys (opsional, untuk fetch data real)
+# ============================================================
+# WEATHER API KEYS
+# ============================================================
 WUNDERGROUND_URL="https://api.weather.com/..."
 ECO_APP_KEY="your-ecowitt-app-key"
 ECO_API_KEY="your-ecowitt-api-key"
 ECO_MAC="your-device-mac"
+
+# ============================================================
+# CACHE (Redis — opsional)
+# ============================================================
+# Jika tidak di-set, otomatis fallback ke in-memory cache
+REDIS_URL="redis://localhost:6379/0"
+# REDIS_URL="redis://:password@hostname:6379/0"  # dengan auth
+
+# ============================================================
+# CORS
+# ============================================================
+# Comma-separated origins (default: * jika tidak di-set)
+CORS_ORIGINS="*"
+
+# ============================================================
+# RATE LIMITING
+# ============================================================
+RATE_LIMIT_REQUESTS=100
+RATE_LIMIT_WINDOW=60
+
+# ============================================================
+# CONSOLE STATION (opsional)
+# ============================================================
+CONSOLE_ENDPOINT_ENABLED=true
+CONSOLE_KEY="your-console-secret-key"
+CONSOLE_IP_WHITELIST="192.168.1.100,10.0.0.50"
 ```
 
 ### Step 6: Jalankan Migrasi Database
@@ -111,23 +145,119 @@ python run.py
 
 Output yang diharapkan:
 ```
-INFO - SECRET_KEY tidak ditemukan di env; dibuat/diambil di instance/secret_key
+INFO - SECRET_KEY diambil dari environment.
 INFO - Cache: menggunakan simple (in-memory) cache.
-INFO - Scheduler initialized but not started.
-INFO - Registered API blueprints: /api (legacy), /api/v3
-INFO - Model ML berhasil diinisialisasi saat startup.
-INFO - Job 'fetch-weather' didaftarkan (interval 5 menit).
-INFO - Job 'hourly-prediction' didaftarkan (cron setiap jam).
+INFO - [Scheduler] Job 'fetch-weather' registered. Next: 10:20:00 WIB
+INFO - [Scheduler] Job 'hourly-prediction-safety' registered
+INFO - CORS enabled for API v3 (origins: *)
+INFO - Registered API blueprint: /api/v3
+INFO - Swagger UI available at: /api/docs
  * Running on http://127.0.0.1:5000
 ```
 
 ### Step 9: Test API
 ```bash
 # Health check (tanpa auth)
-curl http://localhost:5000/api/health
+curl http://127.0.0.1:5000/api/v3/health
 
-# Dengan API key
-curl -H "X-API-KEY: tuws2526" http://localhost:5000/api/data?type=general
+# Cuaca terkini (dengan API key)
+curl -H "X-APP-KEY: tuws2526" http://127.0.0.1:5000/api/v3/weather/current
+```
+
+---
+
+## 📖 Swagger UI (Dokumentasi Interaktif)
+
+Buka di browser:
+```
+http://127.0.0.1:5000/api/docs
+```
+
+Fitur:
+- Lihat semua endpoint dan parameter
+- Coba request langsung dari browser
+- Download OpenAPI specification: `GET /api/v3/openapi.yaml`
+
+---
+
+## 📡 API v3 Endpoints
+
+**Base URL**: `/api/v3`  
+**Authentication**: Header `X-APP-KEY` (kecuali `/health` dan `/weather/console`)  
+**Rate Limit**: 100 requests per 60 detik
+
+| Method | Endpoint | Auth | Deskripsi |
+|--------|----------|------|-----------|
+| GET | `/api/v3/health` | Tidak | Health check sistem |
+| GET | `/api/v3/weather/current` | Ya | Data cuaca terkini |
+| GET | `/api/v3/weather/predict` | Ya | Prediksi ML (LSTM/XGBoost) |
+| GET | `/api/v3/weather/details` | Ya | Detail cuaca (UVI, solar, tekanan) |
+| GET | `/api/v3/weather/history` | Ya | Histori cuaca (pagination + filter) |
+| GET | `/api/v3/weather/graph` | Ya | Data grafik (agregasi harian) |
+| POST/GET | `/api/v3/weather/console` | Console Key | Terima data console station |
+
+### Query Parameters
+
+| Parameter | Endpoint | Values |
+|-----------|----------|--------|
+| `source` | current, predict, details, history, graph | `ecowitt` \| `wunderground` (default: `ecowitt`) |
+| `model` | predict | `lstm` \| `xgboost` (default: `lstm`) |
+| `limit` | predict | `1-24` (default: `12`, LSTM only) |
+| `page` | history | `≥ 1` (default: `1`) |
+| `per_page` | history | `1-10` (default: `5`) |
+| `start_date` | history | ISO 8601 datetime |
+| `end_date` | history | ISO 8601 datetime |
+| `sort` | history | `newest` \| `oldest` (default: `newest`) |
+| `range` | graph | `weekly` \| `monthly` (**wajib**) |
+| `datatype` | graph | `temperature` \| `humidity` \| `rainfall` \| `wind_speed` \| `uvi` \| `solar_radiation` \| `relative_pressure` (**wajib**) |
+| `month` | graph | `1-12` (wajib untuk `range=monthly`) |
+| `year` | graph | `YYYY` (default: tahun ini) |
+
+### Response Format
+```json
+{
+  "meta": {
+    "status": "success",
+    "code": 200,
+    "timestamp": "2026-02-24T03:10:00+00:00",
+    "source": "ecowitt"
+  },
+  "data": { ... }
+}
+```
+
+### Error Response
+```json
+{
+  "meta": {
+    "status": "error",
+    "code": 400,
+    "timestamp": "..."
+  },
+  "error": {
+    "code": "INVALID_PARAMETER",
+    "message": "Human readable message"
+  }
+}
+```
+
+📄 **Dokumentasi lengkap**: lihat [`docs/API_V3_REFERENCE.md`](docs/API_V3_REFERENCE.md)
+
+---
+
+## ⏰ Timezone & Waktu
+
+| Aspek | Format |
+|-------|--------|
+| Database | UTC |
+| API response `timestamp` | UTC ISO 8601 (`+00:00`) |
+| Predict `time_target_predict` | **WIB** (UTC+7) |
+| Graph grouping | Per hari **WIB** |
+| History filter (`start_date`/`end_date`) | Menghormati offset yang dikirim client. Tanpa offset = dianggap UTC |
+
+**Contoh filter history berdasarkan WIB:**
+```http
+GET /api/v3/weather/history?start_date=2026-02-01T00:00:00+07:00&end_date=2026-02-01T23:59:59+07:00
 ```
 
 ---
@@ -135,20 +265,11 @@ curl -H "X-API-KEY: tuws2526" http://localhost:5000/api/data?type=general
 ## 🔄 Perintah Migrasi Database
 
 ```bash
-# Melihat status migrasi
-flask db current
-
-# Membuat migrasi baru setelah mengubah models.py
-flask db migrate -m "Deskripsi perubahan"
-
-# Menerapkan migrasi ke database
-flask db upgrade
-
-# Rollback migrasi terakhir
-flask db downgrade
-
-# Melihat history migrasi
-flask db history
+flask db current           # Status migrasi saat ini
+flask db migrate -m "msg"  # Generate migrasi baru
+flask db upgrade           # Terapkan ke database
+flask db downgrade         # Rollback migrasi terakhir
+flask db history           # History migrasi
 ```
 
 ---
@@ -156,202 +277,64 @@ flask db history
 ## 🧪 Menjalankan Tests
 
 ```bash
-# Test API v3
-python -m tests.test_api_v3
-
-# Test prediction flow
-python -m tests.test_prediction_flow
-
 # Semua tests dengan pytest
 pytest tests/ -v
+
+# Test audit fixes saja
+pytest tests/test_audit_fixes_local.py -v
+
+# Test spesifik
+pytest tests/test_audit_fixes_local.py::TestApiEndpoints -v
 ```
-
----
-
-## 🐳 Docker (Opsional)
-
-```bash
-# Build image
-docker build -t tuws-backend .
-
-# Run container
-docker run -p 5000:5000 --env-file .env tuws-backend
-
-# Atau dengan docker-compose
-docker-compose up -d
-```
-
-## 📡 API Endpoints
-
-### Tersedia Dua Versi API:
-
-| Versi | Base URL | Fitur |
-|-------|----------|-------|
-| **API Biasa (Legacy)** | `/api/*` | X-API-KEY authentication |
-| **API v3 (RESTful)** | `/api/v3/*` | X-API-KEY + CORS + Rate Limiting |
-
----
-
-## 🔐 Authentication
-
-Semua endpoint (kecuali `/health`) memerlukan header `X-API-KEY`:
-
-```
-X-API-KEY: your-api-key
-```
-
-### Development Mode
-Jika environment variable `API_KEY` tidak di-set, API akan berjalan tanpa authentication (untuk development).
-
----
-
-## 📋 API Biasa (Legacy) - `/api/*`
-
-| Method | Endpoint | Deskripsi |
-|--------|----------|-----------|
-| GET | `/api/health` | Health check |
-| GET | `/api/data?type=general` | Data cuaca terkini |
-| GET | `/api/data?type=hourly&model=lstm` | Prediksi per jam (LSTM) |
-| GET | `/api/data?type=hourly&model=xgboost` | Prediksi klasifikasi (XGBoost) |
-| GET | `/api/data?type=detail` | Detail cuaca lengkap |
-| GET | `/api/history` | Riwayat data |
-| GET | `/api/graph` | Data untuk grafik |
-
-### Query Parameters:
-- `source`: `ecowitt` atau `wunderground` (default: `ecowitt`)
-- `model`: `lstm` atau `xgboost` (untuk type=hourly)
-- `limit`: Jumlah data yang ditampilkan
-- `page`: Nomor halaman (untuk history)
-
----
-
-## 🆕 API v3 (RESTful) - `/api/v3/*`
-
-### Fitur Tambahan:
-- ✅ **CORS** - Cross-Origin Resource Sharing enabled
-- ✅ **Rate Limiting** - 100 requests per 60 detik
-- ✅ **X-API-KEY** - Header authentication
-
-### Rate Limit Headers:
-```
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 99
-X-RateLimit-Reset: 1703318400
-```
-
-### Endpoints:
-
-| Method | Endpoint | Deskripsi |
-|--------|----------|-----------|
-| GET | `/api/v3/health` | Health check (no auth) |
-| GET | `/api/v3/weather/current` | Data cuaca & prediksi terkini |
-| GET | `/api/v3/weather/hourly` | Prediksi per jam |
-| GET | `/api/v3/weather/details` | Detail cuaca lengkap |
-| GET | `/api/v3/weather/history` | Riwayat data (pagination) |
-| GET | `/api/v3/weather/graph` | Data untuk chart |
-
-### Query Parameters:
-- `source`: `ecowitt` atau `wunderground`
-- `model`: `lstm` atau `xgboost`
-- `limit`: Jumlah data yang ditampilkan
-- `page`, `per_page`: Pagination (untuk history)
-- `range`: Range hari untuk graph (7, 14, 30)
-- `datatype`: `temperature`, `humidity`, `pressure`, `wind_speed`
-
----
-
-## 🧪 Testing dengan Postman
-
-### Import Collection:
-1. Buka Postman
-2. Click **Import**
-3. Pilih file `postman/TUWS_API_Collection.postman_collection.json`
-4. Import juga environment `postman/TUWS_Local.postman_environment.json`
-
-### Set API Key:
-1. Pilih environment "TUWS Local Development"
-2. Edit variable `api_key` dengan API key yang valid
-3. Jika development tanpa auth, kosongkan saja
-
-### Test Rate Limiting:
-1. Buka request "Test Rate Limiting" di folder API v3
-2. Kirim request berulang kali
-3. Perhatikan header `X-RateLimit-Remaining` berkurang
-
-### Test CORS:
-1. Buka request "Test CORS (Preflight)" di folder API v3
-2. Gunakan method OPTIONS
-3. Periksa response header:
-   - `Access-Control-Allow-Origin`
-   - `Access-Control-Allow-Headers`
-   - `Access-Control-Allow-Methods`
 
 ---
 
 ## 📁 Project Structure
 
 ```
-tuwsbe/
+tuwsbe-fix/
 ├── app/
-│   ├── __init__.py          # Flask app factory
-│   ├── api.py                # API Biasa (Legacy)
-│   ├── api_v3.py             # API v3 (RESTful)
-│   ├── models.py             # SQLAlchemy models
-│   ├── serializers.py        # Data serialization
-│   ├── ml_lstm.py            # LSTM model
-│   ├── ml_xgboost.py         # XGBoost model
-│   ├── jobs.py               # Scheduler jobs
+│   ├── __init__.py              # Flask app factory + Swagger UI
+│   ├── api_v3.py                # API v3 (RESTful) endpoints
+│   ├── models.py                # SQLAlchemy models
+│   ├── serializers.py           # Data serialization & DB queries
+│   ├── jobs.py                  # Scheduler jobs (fetch, predict)
+│   ├── cache.py                 # Redis + in-memory fallback cache
+│   ├── common/
+│   │   └── helpers.py           # Konversi unit, timezone, utilities
 │   └── services/
-│       └── prediction_service.py
-├── ml_models/                # Trained ML models
-├── migrations/               # Database migrations
-├── tests/                    # Test suites
-├── postman/                  # Postman collection & environments
-├── run.py                    # Entry point
-└── requirements.txt
+│       └── prediction_service.py  # ML prediction pipeline
+├── ml_models/                   # Trained ML models (.pkl, .h5)
+├── migrations/                  # Database migrations
+├── tests/                       # Test suites
+├── docs/
+│   ├── API_V3_REFERENCE.md      # Dokumentasi API lengkap
+│   └── openapi.yaml             # OpenAPI 3.0.3 specification
+├── run.py                       # Entry point
+├── requirements.txt
+└── .env                         # Environment variables
 ```
 
 ---
 
 ## 🔧 Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `API_KEY` | API key untuk authentication | (none - no auth) |
-| `DATABASE_URL` | Database connection string | SQLite |
-| `FLASK_ENV` | Environment mode | production |
-
----
-
-## 📊 Response Format
-
-### API Biasa:
-```json
-{
-  "ok": true,
-  "data": { ... }
-}
-```
-
-### API v3:
-```json
-{
-  "ok": true,
-  "data": { ... },
-  "meta": {
-    "timestamp": "2024-12-23T10:30:00+07:00",
-    "version": "v3"
-  }
-}
-```
-
-### Error Response:
-```json
-{
-  "ok": false,
-  "error": {
-    "code": "ERROR_CODE",
-    "message": "Human readable message"
-  }
-}
-```
+| Variable | Deskripsi | Default |
+|----------|-----------|---------|
+| `DATABASE_URL` | PostgreSQL connection string | *(wajib)* |
+| `SECRET_KEY` | Flask secret key | Auto-generate ke `instance/` |
+| `API_READ_KEY` | API key untuk header `X-APP-KEY` | *(tanpa auth jika kosong)* |
+| `FLASK_HOST` | Host binding | `127.0.0.1` |
+| `FLASK_PORT` | Port | `5000` |
+| `FLASK_DEBUG` | Debug mode | `0` |
+| `REDIS_URL` | Redis connection URL | Fallback in-memory |
+| `CORS_ORIGINS` | CORS allowed origins | `*` |
+| `RATE_LIMIT_REQUESTS` | Max requests per window | `100` |
+| `RATE_LIMIT_WINDOW` | Window duration (detik) | `60` |
+| `CONSOLE_ENDPOINT_ENABLED` | Aktifkan console endpoint | `true` |
+| `CONSOLE_KEY` | Secret key untuk console auth | *(wajib untuk console)* |
+| `CONSOLE_IP_WHITELIST` | IP whitelist (comma-separated) | *(opsional)* |
+| `ECO_APP_KEY` | Ecowitt application key | *(opsional)* |
+| `ECO_API_KEY` | Ecowitt API key | *(opsional)* |
+| `ECO_MAC` | Ecowitt device MAC | *(opsional)* |
+| `WUNDERGROUND_URL` | Wunderground API URL | *(opsional)* |

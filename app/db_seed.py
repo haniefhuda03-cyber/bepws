@@ -27,7 +27,7 @@ def seed_labels_and_models(database_url: Optional[str] = None, model_path: Optio
                 pass
 
     if not database_url:
-        database_url = os.environ.get('DATABASE_URL', "mysql+pymysql://root@localhost:3306/tuws_pws")
+        database_url = os.environ.get('DATABASE_URL', "postgresql://postgres@localhost:5432/tuws_pws")
 
     if not model_path:
         model_path = _get_default_model_path()
@@ -41,6 +41,8 @@ def seed_labels_and_models(database_url: Optional[str] = None, model_path: Optio
                 cnt = conn.execute(text('SELECT COUNT(*) AS cnt FROM label')).scalar()
                 _log(f"[db_seed] label count={cnt}")
                 if cnt == 0:
+                    # PERINGATAN: label harus sinkron dengan LABEL_MAP
+                    # di app/services/prediction_service.py
                     label_map_local = [
                         'Cerah / Berawan',
                         'Berpotensi Hujan dari Arah Utara',
@@ -79,9 +81,9 @@ def seed_labels_and_models(database_url: Optional[str] = None, model_path: Optio
                         )
                     _log(f'[db_seed] Seeded table `model` with {len(models_to_seed)} entries.')
                 else:
-                    # Cek apakah LSTM sudah ada
+                    # Cek apakah LSTM sudah ada (exact match, bukan LIKE)
                     lstm_exists = conn.execute(
-                        text("SELECT COUNT(*) FROM model WHERE name LIKE '%lstm%'")
+                        text("SELECT COUNT(*) FROM model WHERE name = 'default_lstm'")
                     ).scalar()
                     if lstm_exists == 0:
                         conn.execute(

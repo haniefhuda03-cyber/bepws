@@ -1,181 +1,446 @@
 """
-API v3 - RESTful API dengan CORS, Rate Limiting, dan X-API-KEY Authentication
-==============================================================================
+API v3 - RESTful Weather API
+============================
+
+Security Features:
+- Rate limiting (100 req/min per IP)
+- Strict query param validation
+- Schema-based validation
+- X-APP-KEY authentication
 
 Endpoints:
-- GET  /api/v3/weather/current     - Data cuaca terkini
-- GET  /api/v3/weather/hourly      - Prediksi per jam (LSTM/XGBoost)
-- GET  /api/v3/weather/details     - Detail prediksi
-- GET  /api/v3/weather/history     - Riwayat prediksi
-- GET  /api/v3/weather/graph       - Data untuk grafik
-- GET  /api/v3/health              - Health check (public)
-
-Security:
-- X-API-KEY header required for protected endpoints
-- Rate limiting per IP address
-- CORS enabled
+1. GET /health - System health check (no auth)
+2. GET /weather/current - Current weather data
+3. GET /weather/predict - Weather predictions (LSTM/XGBoost)
+4. GET /weather/details - Detailed weather data
+5. GET /weather/history - Weather history (paginated)
+6. GET /weather/graph - Graph data
+7. POST/GET /weather/console - Console station data receiver (no auth)
 """
 
-from flask import Blueprint, jsonify, request, current_app, g
-from functools import wraps
-from typing import Optional
 import os
+import re
 import time
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+import hmac
+import logging
 import threading
+from functools import wraps
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+from flask import Blueprint, jsonify, request, g
+from sqlalchemy import text, func as sa_func
+from sqlalchemy.orm import load_only, joinedload
 
-from . import db
-from sqlalchemy import text, func, or_, and_
+from . import db, scheduler
 from . import models
 from . import serializers
-from . import cache
+from .jobs import process_console_data
+from .services.prediction_service import LABEL_MAP
+from .common import helpers
 
 # =====================================================================
-# BLUEPRINT SETUP
+# BLUEPRINT
 # =====================================================================
 
-bp_v3 = Blueprint('api_v3', __name__)
+bp_v3 = Blueprint('api_v3', __name__, url_prefix='/api/v3')
 
 # =====================================================================
-# RATE LIMITING
+# TIMEZONE
+# =====================================================================
+
+WIB = timezone(timedelta(hours=7))
+
+# =====================================================================
+# CONSTANTS
+# =====================================================================
+
+LOCATION = "Sukapura"  # dari neighborhood Wunderground
+
+# =====================================================================
+# RATE LIMITER (In-Memory, Thread-Safe)
 # =====================================================================
 
 class RateLimiter:
     """
-    Simple in-memory rate limiter.
-    Thread-safe implementation using locks.
-    """
-    def __init__(self):
-        self.requests = defaultdict(list)
-        self.lock = threading.Lock()
+    Thread-safe in-memory rate limiter with bounded memory.
     
-    def is_allowed(self, key: str, max_requests: int = 100, window_seconds: int = 60) -> tuple:
+    Enterprise Features:
+    - Periodic cleanup of stale IP entries (setiap 100 request)
+    - Hard cap pada jumlah tracked IPs (default 10,000)
+    - Eviction policy: LRU (Least Recently Used) saat cap tercapai
+    """
+    
+    MAX_TRACKED_IPS = 10_000  # Hard cap untuk mencegah OOM
+    CLEANUP_INTERVAL = 100    # Cleanup setiap N request
+    
+    def __init__(self, max_requests=100, window_seconds=60):
+        self._requests = defaultdict(list)
+        self._lock = threading.Lock()
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._request_count = 0
+    
+    def _cleanup_stale_entries(self, now: float):
         """
-        Check if request is allowed based on rate limit.
-        Returns (allowed: bool, remaining: int, reset_time: int)
+        Hapus semua IP yang tidak punya request dalam window terakhir.
+        Dipanggil secara periodik untuk mencegah memory leak.
         """
-        now = time.time()
-        window_start = now - window_seconds
+        window_start = now - self.window_seconds
+        stale_keys = [
+            k for k, timestamps in self._requests.items()
+            if not timestamps or timestamps[-1] <= window_start
+        ]
+        for k in stale_keys:
+            del self._requests[k]
         
-        with self.lock:
-            # Clean old requests
-            self.requests[key] = [t for t in self.requests[key] if t > window_start]
+        if stale_keys:
+            logging.debug(f"[RateLimiter] Cleaned {len(stale_keys)} stale IPs. Active: {len(self._requests)}")
+    
+    def _evict_oldest_if_needed(self):
+        """
+        Jika jumlah tracked IPs melebihi cap, hapus IP dengan
+        aktivitas paling lama (LRU eviction).
+        """
+        if len(self._requests) <= self.MAX_TRACKED_IPS:
+            return
+        
+        # Sort by last activity timestamp (ascending) dan hapus yang tertua
+        sorted_keys = sorted(
+            self._requests.keys(),
+            key=lambda k: self._requests[k][-1] if self._requests[k] else 0
+        )
+        evict_count = len(self._requests) - self.MAX_TRACKED_IPS
+        for k in sorted_keys[:evict_count]:
+            del self._requests[k]
+        
+        logging.warning(f"[RateLimiter] Evicted {evict_count} oldest IPs (cap: {self.MAX_TRACKED_IPS})")
+    
+    def is_allowed(self, key: str) -> tuple:
+        """Check if request is allowed. Returns (allowed, remaining, reset_time)."""
+        now = time.time()
+        window_start = now - self.window_seconds
+        
+        with self._lock:
+            self._request_count += 1
             
-            current_count = len(self.requests[key])
-            remaining = max(0, max_requests - current_count - 1)
-            reset_time = int(window_start + window_seconds)
+            # Periodic cleanup setiap N request
+            if self._request_count % self.CLEANUP_INTERVAL == 0:
+                self._cleanup_stale_entries(now)
+                self._evict_oldest_if_needed()
             
-            if current_count >= max_requests:
+            # Clean old requests untuk key ini
+            self._requests[key] = [t for t in self._requests[key] if t > window_start]
+            
+            current = len(self._requests[key])
+            remaining = max(0, self.max_requests - current - 1)
+            reset_time = int(now + self.window_seconds)
+            
+            if current >= self.max_requests:
                 return False, 0, reset_time
             
-            self.requests[key].append(now)
+            self._requests[key].append(now)
             return True, remaining, reset_time
-    
-    def clear(self):
-        """Clear all rate limit data."""
-        with self.lock:
-            self.requests.clear()
-
 
 # Global rate limiter instance
-rate_limiter = RateLimiter()
+_rate_limiter = RateLimiter(
+    max_requests=int(os.environ.get('RATE_LIMIT_REQUESTS', 100)),
+    window_seconds=int(os.environ.get('RATE_LIMIT_WINDOW', 60))
+)
 
-# Rate limit configuration from environment
-RATE_LIMIT_REQUESTS = int(os.environ.get('RATE_LIMIT_REQUESTS', 100))
-RATE_LIMIT_WINDOW = int(os.environ.get('RATE_LIMIT_WINDOW', 60))
+# =====================================================================
+# QUERY PARAM VALIDATION SCHEMAS
+# =====================================================================
 
+PARAM_SCHEMAS = {
+    'source': {
+        'type': 'enum',
+        'values': ['ecowitt', 'wunderground'],
+        'default': 'ecowitt',
+        'required': False
+    },
+    'model': {
+        'type': 'enum',
+        'values': ['lstm', 'xgboost'],
+        'default': 'lstm',
+        'required': False
+    },
+    'limit': {
+        'type': 'int',
+        'min': 1,
+        'max': 24,
+        'default': 12,
+        'required': False
+    },
+    'range': {
+        'type': 'enum',
+        'values': ['weekly', 'monthly'],
+        'required': True
+    },
+    'datatype': {
+        'type': 'enum',
+        'values': ['temperature', 'humidity', 'rainfall', 'wind_speed', 'uvi', 'solar_radiation', 'relative_pressure'],
+        'required': True
+    },
+    'month': {
+        'type': 'int',
+        'min': 1,
+        'max': 12,
+        'required': False
+    },
+    'page': {
+        'type': 'int',
+        'min': 1,
+        'default': 1,
+        'required': False
+    },
+    'per_page': {
+        'type': 'int',
+        'min': 1,
+        'max': 10,
+        'default': 5,
+        'required': False
+    },
+    'date': {
+        'type': 'date',
+        'format': r'^\d{4}-\d{2}-\d{2}$',
+        'required': False
+    },
+    'time': {
+        'type': 'time',
+        'format': r'^\d{2}:\d{2}$',
+        'required': False
+    },
+    'start_date': {
+        'type': 'iso8601',
+        'required': False
+    },
+    'end_date': {
+        'type': 'iso8601',
+        'required': False
+    },
+    'sort': {
+        'type': 'enum',
+        'values': ['newest', 'oldest'],
+        'default': 'newest',
+        'required': False
+    }
+}
 
-def get_client_ip() -> str:
-    """Get client IP address, considering proxies."""
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-    if request.headers.get('X-Real-IP'):
-        return request.headers.get('X-Real-IP')
-    return request.remote_addr or 'unknown'
+# Allowed query params per endpoint
+ENDPOINT_PARAMS = {
+    'health': [],
+    'weather_current': ['source'],
+    'weather_predict': ['source', 'model', 'limit'],
+    'weather_details': ['source'],
+    'weather_history': ['source', 'page', 'per_page', 'start_date', 'end_date', 'sort'],
+    'weather_graph': ['range', 'datatype', 'source', 'month'],
+    'weather_console': []  # POST accepts form data
+}
 
 
 # =====================================================================
-# AUTHENTICATION & AUTHORIZATION
+# HELPER FUNCTIONS
 # =====================================================================
 
-def require_api_key(f):
-    """
-    Decorator to require X-API-KEY header for protected endpoints.
-    If API_KEY is not set in environment, all requests are allowed (development mode).
-    """
+def _meta(status="success", code=200, source=None, extra=None):
+    """Build standard meta response."""
+    m = {
+        "status": status,
+        "code": code,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    if source:
+        m["source"] = source
+    if extra:
+        m.update(extra)
+    return m
+
+
+def _error(code, message, status_code=400, extra=None):
+    """Build standard error response."""
+    return jsonify({
+        "meta": _meta("error", status_code, extra=extra),
+        "error": {
+            "code": code,
+            "message": message
+        },
+        "data": None
+    }), status_code
+
+# =====================================================================
+# AUTH DECORATOR
+# =====================================================================
+
+def require_auth(f):
+    """Decorator untuk require X-APP-KEY header."""
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        api_key = os.environ.get('API_KEY') or os.environ.get('API_READ_KEY')
+    def decorated(*args, **kwargs):
+        app_key = os.environ.get('APPKEY')
         
-        # If no API key configured, allow all (development mode)
-        if not api_key:
-            return f(*args, **kwargs)
+        # APPKEY wajib dikonfigurasi di production
+        if not app_key:
+            logging.warning("[Auth] APPKEY not configured in environment")
+            return _error("SERVER_CONFIG", "Authentication not configured", 500)
         
-        provided_key = request.headers.get('X-API-KEY')
+        provided_key = request.headers.get('X-APP-KEY')
         
         if not provided_key:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'MISSING_API_KEY',
-                    'message': 'X-API-KEY header is required'
-                }
-            }), 401
+            return _error("MISSING_AUTH", "X-APP-KEY header is required", 401)
         
-        if provided_key != api_key:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_API_KEY',
-                    'message': 'Invalid API key provided'
-                }
-            }), 401
+        # Use timing-safe comparison to prevent timing attacks
+        if not hmac.compare_digest(provided_key.encode(), app_key.encode()):
+            return _error("INVALID_AUTH", "Invalid X-APP-KEY", 401)
         
         return f(*args, **kwargs)
-    return decorated_function
+    return decorated
 
 
-def apply_rate_limit(f):
-    """
-    Decorator to apply rate limiting to endpoints.
-    """
+# =====================================================================
+# RATE LIMITING DECORATOR
+# =====================================================================
+
+def rate_limit(f):
+    """Decorator untuk rate limiting per IP."""
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        client_ip = get_client_ip()
-        allowed, remaining, reset_time = rate_limiter.is_allowed(
-            client_ip, 
-            RATE_LIMIT_REQUESTS, 
-            RATE_LIMIT_WINDOW
-        )
+    def decorated(*args, **kwargs):
+        # Get client IP (supports reverse proxy)
+        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        if client_ip:
+            client_ip = client_ip.split(',')[0].strip()
+        
+        allowed, remaining, reset_time = _rate_limiter.is_allowed(client_ip)
         
         # Add rate limit headers to response
         g.rate_limit_remaining = remaining
         g.rate_limit_reset = reset_time
-        g.rate_limit_limit = RATE_LIMIT_REQUESTS
+        g.rate_limit_limit = _rate_limiter.max_requests
         
         if not allowed:
             response = jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'RATE_LIMIT_EXCEEDED',
-                    'message': f'Rate limit exceeded. Try again in {reset_time - int(time.time())} seconds'
-                }
+                "meta": _meta("error", 429),
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "message": "Too many requests. Please slow down."
+                },
+                "data": None
             })
-            response.status_code = 429
-            response.headers['X-RateLimit-Limit'] = str(RATE_LIMIT_REQUESTS)
+            response.headers['X-RateLimit-Limit'] = str(_rate_limiter.max_requests)
             response.headers['X-RateLimit-Remaining'] = '0'
             response.headers['X-RateLimit-Reset'] = str(reset_time)
-            response.headers['Retry-After'] = str(reset_time - int(time.time()))
-            return response
+            response.headers['Retry-After'] = str(_rate_limiter.window_seconds)
+            return response, 429
         
         return f(*args, **kwargs)
-    return decorated_function
+    return decorated
 
+
+# =====================================================================
+# STRICT QUERY PARAM VALIDATOR
+# =====================================================================
+
+def strict_params(endpoint_name):
+    """
+    Decorator untuk validasi ketat query params.
+    Rejects unknown params dan validates format.
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            allowed_params = ENDPOINT_PARAMS.get(endpoint_name, [])
+            
+            # Check for unknown params
+            for param in request.args:
+                if param not in allowed_params:
+                    return _error(
+                        "UNKNOWN_PARAMETER",
+                        f"Unknown query parameter: '{param}'. Allowed: {', '.join(allowed_params) if allowed_params else 'none'}",
+                        400
+                    )
+            
+            # Validate each provided param
+            for param, value in request.args.items():
+                schema = PARAM_SCHEMAS.get(param)
+                if not schema:
+                    continue
+                
+                # Check empty values
+                if value.strip() == '':
+                    return _error(
+                        "INVALID_PARAMETER",
+                        f"Query param '{param}' cannot be empty",
+                        400
+                    )
+                
+                # Check for leading/trailing spaces (Strict No Space Policy)
+                if value != value.strip():
+                     return _error(
+                        "INVALID_PARAMETER",
+                        f"Query param '{param}' cannot contain spaces",
+                        400
+                    )
+
+                
+                # Type validation
+                if schema['type'] == 'enum':
+                    if value.lower() not in schema['values']:
+                        return _error(
+                            "INVALID_PARAMETER",
+                            f"Invalid value for '{param}'. Allowed: {', '.join(schema['values'])}",
+                            400
+                        )
+                
+                elif schema['type'] == 'int':
+                    try:
+                        int_val = int(value)
+                        if 'min' in schema and int_val < schema['min']:
+                            return _error(
+                                "INVALID_PARAMETER",
+                                f"'{param}' must be >= {schema['min']}",
+                                400
+                            )
+                        if 'max' in schema and int_val > schema['max']:
+                            return _error(
+                                "INVALID_PARAMETER",
+                                f"'{param}' must be <= {schema['max']}",
+                                400
+                            )
+                    except ValueError:
+                        return _error(
+                            "INVALID_PARAMETER",
+                            f"'{param}' must be a valid integer",
+                            400
+                        )
+                
+                elif schema['type'] in ('date', 'time'):
+                    if not re.match(schema['format'], value):
+                        return _error(
+                            "INVALID_PARAMETER",
+                            f"Invalid format for '{param}'",
+                            400
+                        )
+                
+                elif schema['type'] == 'iso8601':
+                    try:
+                        datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    except (ValueError, AttributeError):
+                        return _error(
+                            "INVALID_PARAMETER",
+                            f"'{param}' must be a valid ISO 8601 datetime (e.g. 2026-02-01T00:00:00Z)",
+                            400
+                        )
+            
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
+
+# =====================================================================
+# RATE LIMIT HEADERS (after_request for blueprint)
+# =====================================================================
 
 @bp_v3.after_request
 def add_rate_limit_headers(response):
-    """Add rate limit headers to all responses."""
+    """Add rate limit headers to all API responses."""
     if hasattr(g, 'rate_limit_limit'):
         response.headers['X-RateLimit-Limit'] = str(g.rate_limit_limit)
         response.headers['X-RateLimit-Remaining'] = str(g.rate_limit_remaining)
@@ -184,830 +449,705 @@ def add_rate_limit_headers(response):
 
 
 # =====================================================================
-# HELPER FUNCTIONS
+# 0. OPENAPI SPECIFICATION ENDPOINT
 # =====================================================================
 
-WIB = timezone(timedelta(hours=7))
-
-
-def _to_wib_iso(dt):
-    """Convert datetime to WIB timezone ISO format."""
-    if not dt:
-        return None
+@bp_v3.route('/openapi.yaml', methods=['GET'])
+def openapi_spec():
+    """
+    Serve OpenAPI specification file.
+    No authentication required.
+    """
+    import pathlib
+    
+    # Find the openapi.yaml file relative to the app
+    app_dir = pathlib.Path(__file__).parent.parent
+    openapi_path = app_dir / 'docs' / 'openapi.yaml'
+    
+    if not openapi_path.exists():
+        return _error("NOT_FOUND", "OpenAPI specification not found", 404)
+    
     try:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        wib = dt.astimezone(WIB)
-        return wib.isoformat()
-    except Exception:
-        try:
-            return dt.isoformat()
-        except Exception:
-            return None
-
-
-def _deg_to_compass(deg: Optional[float]) -> Optional[str]:
-    """Convert degrees to compass direction."""
-    if deg is None:
-        return None
-    try:
-        d = float(deg) % 360
-    except Exception:
-        return None
-    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
-    ix = int((d / 22.5) + 0.5) % 16
-    return dirs[ix]
-
-
-def _validate_source(source: Optional[str]) -> tuple:
-    """Validate source parameter. Returns (valid_source, error_response or None)."""
-    if not source:
-        source = 'ecowitt'
-    source = source.lower()
-    if source not in ('ecowitt', 'wunderground'):
-        return None, (jsonify({
-            'ok': False,
-            'error': {
-                'code': 'INVALID_PARAMETER',
-                'message': "Invalid source. Use 'ecowitt' or 'wunderground'"
-            }
-        }), 400)
-    return source, None
-
-
-def _validate_model(model: Optional[str]) -> tuple:
-    """Validate model parameter. Returns (valid_model, error_response or None)."""
-    if not model:
-        model = 'lstm'
-    model = model.lower()
-    if model not in ('lstm', 'xgboost'):
-        return None, (jsonify({
-            'ok': False,
-            'error': {
-                'code': 'INVALID_PARAMETER',
-                'message': "Invalid model. Use 'lstm' or 'xgboost'"
-            }
-        }), 400)
-    return model, None
+        with open(openapi_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        from flask import Response
+        return Response(content, mimetype='text/yaml')
+    except Exception as e:
+        logging.error(f"Failed to read OpenAPI spec: {e}")
+        return _error("SERVER_ERROR", "Failed to load OpenAPI specification", 500)
 
 
 # =====================================================================
-# API ENDPOINTS
+# 1. HEALTH ENDPOINT
 # =====================================================================
 
 @bp_v3.route('/health', methods=['GET'])
-@apply_rate_limit
+@rate_limit
+@strict_params('health')
 def health():
     """
-    Health check endpoint (public, no API key required).
-    
-    Returns:
-        - Database status
-        - Scheduler status
-        - API version info
+    Health check endpoint (no auth).
+    Returns database, scheduler, and API status.
     """
     ok = True
-    details = {
-        'api_version': 'v3',
-        'timestamp': datetime.now(WIB).isoformat(),
+    data = {
+        "api_version": "v3",
+        "database": "unknown",
+        "scheduler": "unknown"
     }
     
     # Check database
     try:
         db.session.execute(text('SELECT 1'))
-        details['database'] = 'ok'
+        data["database"] = "connected"
     except Exception as e:
         ok = False
-        details['database'] = f'error: {str(e)}'
+        data["database"] = "error"  # Don't leak error details
+        logging.error(f"Health check DB error: {e}")
     
     # Check scheduler
     try:
-        sched = current_app.extensions.get('apscheduler')
-        if sched is None:
-            details['scheduler'] = 'not_initialized'
+        if scheduler is None:
+            data["scheduler"] = "not_initialized"
         else:
-            state = getattr(sched, 'state', None)
-            jobs = getattr(sched, 'get_jobs', lambda: [])()
-            job_ids = [j.id for j in jobs] if jobs else []
-            
-            if state == 1:
-                details['scheduler'] = 'running'
-            elif state == 0:
-                details['scheduler'] = 'stopped'
+            is_running = getattr(scheduler, 'running', False)
+            if is_running:
+                data["scheduler"] = "running"
+                jobs = scheduler.get_jobs() if hasattr(scheduler, 'get_jobs') else []
+                data["jobs"] = [j.id for j in jobs]
             else:
-                details['scheduler'] = f'unknown_state_{state}'
-            
-            details['scheduler_jobs'] = job_ids
+                data["scheduler"] = "stopped"
     except Exception as e:
-        details['scheduler'] = f'error: {str(e)}'
+        data["scheduler"] = "error"  # Don't leak error details
+        logging.error(f"Health check scheduler error: {e}")
     
-    status_code = 200 if ok else 500
     return jsonify({
-        'ok': ok,
-        'data': details
-    }), status_code
+        "meta": _meta("success" if ok else "error", 200 if ok else 500),
+        "data": data
+    }), 200 if ok else 500
 
+
+# =====================================================================
+# 2. CURRENT WEATHER ENDPOINT
+# =====================================================================
 
 @bp_v3.route('/weather/current', methods=['GET'])
-@apply_rate_limit
-@require_api_key
+@rate_limit
+@require_auth
+@strict_params('weather_current')
 def weather_current():
     """
     Get current weather data.
-    
-    Query Parameters:
-        - source: 'ecowitt' (default) or 'wunderground'
-    
-    Returns:
-        Current weather conditions with prediction
+    Query params: source (ecowitt|wunderground, default: ecowitt)
     """
-    source = request.args.get('source', 'ecowitt').lower()
-    source, error = _validate_source(source)
-    if error:
-        return error
+    source = request.args.get('source', 'ecowitt')
     
-    payload = serializers.get_source_current_payload(source)
+    # Use serializer
+    payload = serializers.get_current_payload(source=source)
+    
     if not payload.get('ok'):
-        return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'NO_DATA',
-                'message': 'No weather data available'
-            }
-        }), 404
+        return _error("NO_DATA", payload.get('message', "No weather data available"), 404, extra={"source": source})
+        
+    return jsonify({
+        "meta": _meta(source=source),
+        "data": payload.get('data')
+    }), 200
+
+
+# =====================================================================
+# 3. PREDICT ENDPOINT
+# =====================================================================
+
+@bp_v3.route('/weather/predict', methods=['GET'])
+@rate_limit
+@require_auth
+@strict_params('weather_predict')
+def weather_predict():
+    """
+    Get weather predictions.
+    Query params:
+        - source: ecowitt|wunderground (default: ecowitt)
+        - model: lstm|xgboost (default: lstm)
+        - limit: 1-24, default 12 (for lstm only, error if used with xgboost)
+    """
+    source = request.args.get('source', 'ecowitt')
+    model = request.args.get('model', 'lstm').lower().strip()
     
-    pl = payload['data']
-    wu = pl.get('weather_wunderground')
-    eco = pl.get('weather_ecowitt')
+    # Validate limit
+    limit_raw = request.args.get('limit')
+    limit = 12
+    if limit_raw:
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            return _error("INVALID_PARAMETER", "Limit must be valid integer")
+            
+    if model == 'xgboost' and limit_raw:
+         return _error("INVALID_PARAMETER", "Limit not allowed for XGBoost")
+         
+    # Call Serializer
+    # Helper: get_prediction_payload returns a list.
+    # Note: get_prediction_payload di serializers.py didesain generik.
+    # Kita perlu sesuaikan outputnya agar sama dengan format response v3 yang lama
+    # yaitu XGBoost return single object, LSTM return array.
     
-    # Get latest prediction log
+    # Namun `get_prediction_payload` yang baru saya buat mengembalikan LIST of prediction logs.
+    # Ini mungkin tidak cocok 100% dengan endpoint ini yang mengharapkan:
+    # XGBoost -> Single object (latest)
+    # LSTM -> Array of hourly predictions (from single latest log)
+    
+    # Wait, `get_prediction_payload` logic was:
+    # "Get prediction logs strictly from PredictionLog tables."
+    # AND it handles: "Serialize and batch-pair with companion LSTM"
+    
+    # Endpoint `weather_predict` sebelumnya melogika:
+    # Ambil 1 PredictionLog TERBARU.
+    # Jika XGBoost: return result XGBoost dari log tersebut.
+    # Jika LSTM: return result LSTM (array) dari log tersebut.
+    
+    # Serializer `get_prediction_payload` yang saya buat return multiple logs (limit).
+    # Ini cocok untuk dashboard history prediksi, TAPI endpoint ini `/weather/predict`
+    # sepertinya untuk "Latest Prediction".
+    
+    # Mari kita gunakan logic `get_prediction_payload` TAPI limit=1.
+    payload = serializers.get_prediction_payload(source=source, limit=1)
+    
+    if not payload.get('data'):
+        return _error("NO_DATA", "No prediction data available", 404)
+        
+    latest_log = payload['data'][0] # Serialized PredictionLog
+    
+    # Now extrat specific part based on model
+    log_id = latest_log['id']
+    timestamp_iso = latest_log['created_at'] # UTC ISO
+    
+    # Convert TS to WIB for target calc
+    # Note: Serializer returns ISO string. We parse back.
+    ts_utc = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
+    ts_wib = ts_utc.astimezone(WIB)
+    base_hour_wib = ts_wib.replace(minute=0, second=0, microsecond=0)
+    
+    if model == 'xgboost':
+        # Extract XGBoost prediction
+        # Structure: "ecowitt_prediction": {"name": "Hujan Ringan", ...}
+        pred_key = f"{source}_prediction"
+        pred_obj = latest_log.get(pred_key)
+        
+        if not pred_obj:
+             return _error("NO_DATA", f"No XGBoost prediction for {source}", 404)
+             
+        target_dt_wib = base_hour_wib + timedelta(hours=1)
+        data = {
+            "id": log_id,
+            "timestamp": timestamp_iso,
+            "time_target_predict": target_dt_wib.strftime("%H:%M"),
+            "date_target_predict": target_dt_wib.strftime("%d-%m-%y"),
+            "temp": None, 
+            "weather_predict": pred_obj.get('name')
+        }
+        
+    else: # LSTM
+        # Extract LSTM prediction
+        # Structure: "ecowitt_lstm_data": [0.0, 0.1, ...]
+        lstm_key = f"{source}_lstm_data"
+        result_array = latest_log.get(lstm_key)
+        
+        if not result_array:
+             return _error("NO_DATA", f"No LSTM prediction for {source}", 404)
+             
+        predictions = []
+        for i in range(min(limit, len(result_array))):
+            hour_offset = i + 1
+            target_dt_wib = base_hour_wib + timedelta(hours=hour_offset)
+            predictions.append({
+                "id": i + 1,
+                "timestamp": timestamp_iso,
+                "time_target_predict": target_dt_wib.strftime("%H:%M"),
+                "date_target_predict": target_dt_wib.strftime("%d-%m-%y"),
+                "temp": None,
+                "weather_predict": round(result_array[i], 3) if result_array[i] is not None else None
+            })
+        data = predictions
+
+    return jsonify({
+        "meta": _meta(source=source, extra={"model": model}),
+        "data": data
+    }), 200
+
+
+# =====================================================================
+# 4. DETAILS ENDPOINT
+# =====================================================================
+
+@bp_v3.route('/weather/details', methods=['GET'])
+@rate_limit
+@require_auth
+@strict_params('weather_details')
+def weather_details():
+    """
+    Get detailed weather data.
+    Query params: source (ecowitt|wunderground, default: ecowitt)
+    
+    Cache: TTL 60s. Data terbaru saja, sama dengan /weather/current.
+    """
+    # Source validation handled by @strict_params
+    source = request.args.get('source', 'ecowitt')
+    
+    # Build params_applied early
+    params_applied = {}
+    if request.args.get('source'):
+        params_applied["source"] = source
+    
+    extra_meta_success = {"params_applied": params_applied} if params_applied else None
+    
+    # 1. Try Cache
+    cache_key = f"weather_details:{source}"
     try:
-        pl_db = db.session.query(models.PredictionLog).order_by(
-            models.PredictionLog.created_at.desc()
-        ).first()
+        from app import cache as _cache
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            return jsonify({
+                "meta": _meta(source=source, extra=extra_meta_success),
+                "data": cached
+            }), 200
     except Exception:
-        pl_db = None
+        pass
     
-    # Build response based on source
+    # 2. Query latest data
     if source == 'ecowitt':
-        weather_data = eco or {}
-        prediction = pl.get('ecowitt_prediction')
+        load_fields = [
+            models.WeatherLogEcowitt.id,
+            models.WeatherLogEcowitt.created_at,
+            models.WeatherLogEcowitt.vpd_outdoor,
+            models.WeatherLogEcowitt.temperature_feels_like_outdoor,
+            models.WeatherLogEcowitt.uvi,
+            models.WeatherLogEcowitt.solar_irradiance,
+            models.WeatherLogEcowitt.wind_gust,
+            models.WeatherLogEcowitt.pressure_relative,
+        ]
     else:
-        weather_data = wu or {}
-        prediction = pl.get('wunderground_prediction')
+        load_fields = [
+            models.WeatherLogWunderground.id,
+            models.WeatherLogWunderground.created_at,
+            models.WeatherLogWunderground.ultraviolet_radiation,
+            models.WeatherLogWunderground.solar_radiation,
+            models.WeatherLogWunderground.wind_gust,
+            models.WeatherLogWunderground.pressure,
+        ]
+
+    wl = serializers.get_latest_weather_data(source, load_fields=load_fields)
     
-    response_data = {
-        'id': pl_db.id if pl_db else None,
-        'source': source,
-        'timestamp': _to_wib_iso(pl_db.created_at if pl_db else None),
-        'weather': {
-            'temperature': weather_data.get('temperature_main_outdoor') if source == 'ecowitt' else weather_data.get('temperature'),
-            'humidity': weather_data.get('humidity_outdoor') if source == 'ecowitt' else weather_data.get('humidity'),
-            'pressure': weather_data.get('pressure_relative') if source == 'ecowitt' else weather_data.get('pressure'),
-            'wind_speed': weather_data.get('wind_speed'),
-            'wind_direction': weather_data.get('wind_direction'),
-            'wind_compass': _deg_to_compass(weather_data.get('wind_direction')),
-            'rain_rate': weather_data.get('rain_rate') if source == 'ecowitt' else weather_data.get('precipitation_rate'),
-            'uvi': weather_data.get('uvi') if source == 'ecowitt' else weather_data.get('ultraviolet_radiation'),
-            'dew_point': weather_data.get('dew_point_outdoor') if source == 'ecowitt' else None,
-        },
-        'prediction': prediction,
+    if not wl:
+        return _error("NO_DATA", "No weather data available", 404, extra=extra_meta_success)
+    
+    # Build response
+    if source == 'ecowitt':
+        data = {
+            "id": wl.id,
+            "timestamp": helpers.to_utc_iso(wl.created_at),
+            "vpd_outdoor": wl.vpd_outdoor,
+            "feels_like": wl.temperature_feels_like_outdoor,
+            "uvi": wl.uvi,
+            "solar_irradiance": wl.solar_irradiance,
+            "wind_gust": wl.wind_gust,
+            "pressure_relative": wl.pressure_relative,
+        }
+    else:
+        data = {
+            "id": wl.id,
+            "timestamp": helpers.to_utc_iso(wl.created_at),
+            "vpd_outdoor": None,
+            "feels_like": None,
+            "uvi": wl.ultraviolet_radiation,
+            "solar_irradiance": wl.solar_radiation,
+            "wind_gust": wl.wind_gust,
+            "pressure_relative": wl.pressure,
+        }
+    
+    # 3. Set Cache
+    try:
+        from app import cache as _cache
+        _cache.set(cache_key, data, timeout=60)
+    except Exception:
+        pass
+    
+    return jsonify({
+        "meta": _meta(source=source, extra=extra_meta_success),
+        "data": data
+    }), 200
+
+
+# =====================================================================
+# 5. HISTORY ENDPOINT
+# =====================================================================
+
+@bp_v3.route('/weather/history', methods=['GET'])
+@rate_limit
+@require_auth
+@strict_params('weather_history')
+def weather_history():
+    """
+    Get paginated weather history with filtering and sorting.
+    Query params:
+        - source: ecowitt|wunderground (default: ecowitt)
+        - page: integer >= 1 (default: 1)
+        - per_page: 1-10 (default: 5)
+        - start_date: ISO 8601 datetime, filter from (optional)
+        - end_date: ISO 8601 datetime, filter until (optional)
+        - sort: 'newest' (DESC) or 'oldest' (ASC). Default: 'newest'
+    """
+    # Params
+    source = request.args.get('source', 'ecowitt')
+    page = int(request.args.get('page') or 1)
+    per_page = int(request.args.get('per_page') or 5)
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    sort = request.args.get('sort', 'newest')
+    
+    # Use serializer
+    payload = serializers.get_history_payload(
+        page=page,
+        per_page=per_page,
+        start_date=start_date,
+        end_date=end_date,
+        data_source=source,
+        sort=sort
+    )
+    
+    if not payload.get('ok'):
+        return _error("INVALID_REQUEST", payload.get('message', "Request failed"), 400)
+    
+    # Build Extra Meta
+    total = payload.get('total', 0)
+    total_pages = (total + per_page - 1) // per_page if total > 0 else 0
+    
+    extra_meta = {
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_prev": page > 1
     }
     
     return jsonify({
-        'ok': True,
-        'data': response_data
+        "meta": _meta(source=payload.get('source'), extra=extra_meta),
+        "data": payload.get('data')
     }), 200
 
 
-@bp_v3.route('/weather/hourly', methods=['GET'])
-@apply_rate_limit
-@require_api_key
-def weather_hourly():
-    """
-    Get hourly weather prediction.
-    
-    Query Parameters:
-        - model: 'lstm' (default) or 'xgboost'
-        - source: 'ecowitt' (default) or 'wunderground'
-        - limit: 1-24 (optional, default shows all 24 hours)
-    
-    Returns:
-        - For LSTM: 24-hour rainfall intensity predictions
-        - For XGBoost: Rain direction classification
-    """
-    # Validate parameters
-    model_param = request.args.get('model', 'lstm').lower()
-    model_param, error = _validate_model(model_param)
-    if error:
-        return error
-    
-    source = request.args.get('source', 'ecowitt').lower()
-    source, error = _validate_source(source)
-    if error:
-        return error
-    
-    # Validate limit
-    limit_param = request.args.get('limit')
-    limit = None
-    if limit_param is not None:
-        try:
-            limit = int(limit_param)
-            if limit < 1 or limit > 24:
-                return jsonify({
-                    'ok': False,
-                    'error': {
-                        'code': 'INVALID_PARAMETER',
-                        'message': 'Limit must be between 1 and 24'
-                    }
-                }), 400
-        except ValueError:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'Limit must be a valid integer'
-                }
-            }), 400
-    
-    # Get latest prediction
-    pl = db.session.query(models.PredictionLog).order_by(
-        models.PredictionLog.created_at.desc()
-    ).first()
-    
-    if not pl:
-        return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'NO_DATA',
-                'message': 'No prediction data available'
-            }
-        }), 404
-    
-    # Ensure created_at has timezone
-    created_at = pl.created_at
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    created_at_wib = created_at.astimezone(WIB)
-    
-    if model_param == 'lstm':
-        from .services.prediction_service import get_model_info
-        
-        # Get LSTM data
-        lstm_data = pl.ecowitt_predict_data if source == 'ecowitt' else pl.wunderground_predict_data
-        
-        if not lstm_data:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'NO_DATA',
-                    'message': f'No LSTM prediction data for {source}'
-                }
-            }), 404
-        
-        # Get model info from database
-        lstm_model_db = pl.lstm_model
-        lstm_model_info = get_model_info('lstm')
-        
-        # Build predictions array
-        predictions = []
-        total_available = len(lstm_data)
-        
-        for i, value in enumerate(lstm_data):
-            if limit is not None and len(predictions) >= limit:
-                break
-            
-            pred_time = created_at_wib + timedelta(hours=i+1)
-            predictions.append({
-                'hour': i + 1,
-                'datetime': pred_time.isoformat(),
-                'date': pred_time.strftime('%Y-%m-%d'),
-                'time': pred_time.strftime('%H:%M'),
-                'value': value,
-            })
-        
-        return jsonify({
-            'ok': True,
-            'data': {
-                'model': {
-                    'id': lstm_model_db.id if lstm_model_db else lstm_model_info['id'],
-                    'name': lstm_model_db.name if lstm_model_db else lstm_model_info['name'],
-                    'range_prediction': lstm_model_db.range_prediction if lstm_model_db else lstm_model_info['range_prediction'],
-                },
-                'prediction': {
-                    'id': pl.id,
-                    'source': source,
-                    'predicted_at': created_at_wib.isoformat(),
-                    'total_hours': total_available,
-                    'showing': len(predictions),
-                    'limit_applied': limit,
-                },
-                'hourly': predictions,
-            }
-        }), 200
-    
-    else:  # xgboost
-        from .services.prediction_service import get_label_from_db, get_model_info
-        
-        # Get XGBoost result
-        xgboost_result = pl.ecowitt_predict_result if source == 'ecowitt' else pl.wunderground_predict_result
-        
-        # Get label and model info from database
-        label_info = get_label_from_db(xgboost_result) if xgboost_result is not None else None
-        xgboost_model_info = get_model_info('xgboost')
-        model_db = pl.xgboost_model
-        
-        return jsonify({
-            'ok': True,
-            'data': {
-                'model': {
-                    'id': model_db.id if model_db else xgboost_model_info['id'],
-                    'name': model_db.name if model_db else xgboost_model_info['name'],
-                    'range_prediction': model_db.range_prediction if model_db else xgboost_model_info['range_prediction'],
-                },
-                'prediction': {
-                    'id': pl.id,
-                    'source': source,
-                    'predicted_at': created_at_wib.isoformat(),
-                },
-                'classification': label_info,
-            }
-        }), 200
-
-
-@bp_v3.route('/weather/details', methods=['GET'])
-@apply_rate_limit
-@require_api_key
-def weather_details():
-    """
-    Get detailed weather prediction data.
-    
-    Query Parameters:
-        - id: Prediction ID (optional, defaults to latest)
-        - source: 'ecowitt' (default) or 'wunderground'
-    
-    Returns:
-        Detailed weather data with all sensor readings
-    """
-    source = request.args.get('source', 'ecowitt').lower()
-    source, error = _validate_source(source)
-    if error:
-        return error
-    
-    pid = request.args.get('id')
-    
-    base_q = db.session.query(models.PredictionLog)
-    
-    if source == 'ecowitt':
-        base_q = base_q.filter(models.PredictionLog.weather_log_ecowitt_id.isnot(None))
-    else:
-        base_q = base_q.filter(models.PredictionLog.weather_log_wunderground_id.isnot(None))
-    
-    if pid:
-        try:
-            pid_int = int(pid)
-        except ValueError:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'ID must be a valid integer'
-                }
-            }), 400
-        
-        pl = base_q.filter_by(id=pid_int).first()
-        if not pl:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'NOT_FOUND',
-                    'message': f'Prediction with ID {pid_int} not found'
-                }
-            }), 404
-    else:
-        pl = base_q.order_by(models.PredictionLog.created_at.desc()).first()
-        if not pl:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'NO_DATA',
-                    'message': 'No prediction data found'
-                }
-            }), 404
-    
-    # Get weather log
-    if source == 'ecowitt':
-        wl = pl.weather_log_ecowitt
-    else:
-        wl = pl.weather_log_wunderground
-    
-    time_wib = _to_wib_iso(pl.created_at)
-    
-    # Build detailed response based on source
-    if source == 'ecowitt' and wl:
-        details = {
-            'uvi': wl.uvi,
-            'vpd_outdoor': wl.vpd_outdoor,
-            'temperature': wl.temperature_main_outdoor,
-            'feels_like': wl.temperature_feels_like_outdoor,
-            'dew_point': wl.dew_point_outdoor,
-            'humidity': wl.humidity_outdoor,
-            'pressure_absolute': wl.pressure_absolute,
-            'pressure_relative': wl.pressure_relative,
-            'wind_speed': wl.wind_speed,
-            'wind_gust': wl.wind_gust,
-            'wind_direction': wl.wind_direction,
-            'wind_compass': _deg_to_compass(wl.wind_direction),
-            'rain_rate': wl.rain_rate,
-            'rain_daily': wl.rain_daily,
-            'rain_hourly': wl.rain_hour,
-            'solar_irradiance': wl.solar_irradiance,
-        }
-    elif source == 'wunderground' and wl:
-        details = {
-            'uvi': wl.ultraviolet_radiation,
-            'temperature': wl.temperature,
-            'humidity': wl.humidity,
-            'pressure': wl.pressure,
-            'wind_speed': wl.wind_speed,
-            'wind_gust': wl.wind_gust,
-            'wind_direction': wl.wind_direction,
-            'wind_compass': _deg_to_compass(wl.wind_direction),
-            'rain_rate': wl.precipitation_rate,
-            'rain_total': wl.precipitation_total,
-            'solar_radiation': wl.solar_radiation,
-        }
-    else:
-        details = None
-    
-    return jsonify({
-        'ok': True,
-        'data': {
-            'id': pl.id,
-            'source': source,
-            'timestamp': time_wib,
-            'weather': details,
-        }
-    }), 200
-
-
-@bp_v3.route('/weather/history', methods=['GET'])
-@apply_rate_limit
-@require_api_key
-def weather_history():
-    """
-    Get prediction history.
-    
-    Query Parameters:
-        - page: Page number (default: 1)
-        - per_page: Items per page (default: 10, max: 50)
-        - source: 'ecowitt' (default) or 'wunderground'
-        - date: Single date filter (YYYY-MM-DD)
-        - time: Single time filter (HH:MM)
-        - start_date: Start date range (YYYY-MM-DD)
-        - end_date: End date range (YYYY-MM-DD)
-        - start_time: Start time range (HH:MM)
-        - end_time: End time range (HH:MM)
-    
-    Returns:
-        Paginated prediction history
-    """
-    source = request.args.get('source', 'ecowitt').lower()
-    source, error = _validate_source(source)
-    if error:
-        return error
-    
-    # Pagination
-    try:
-        page = int(request.args.get('page', 1))
-        if page < 1:
-            page = 1
-    except ValueError:
-        return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'INVALID_PARAMETER',
-                'message': 'Page must be a valid integer'
-            }
-        }), 400
-    
-    try:
-        per_page = int(request.args.get('per_page', 10))
-        if per_page < 1:
-            per_page = 10
-        if per_page > 50:
-            per_page = 50
-    except ValueError:
-        per_page = 10
-    
-    offset = (page - 1) * per_page
-    
-    # Date/Time parsing helpers
-    def parse_date(s):
-        try:
-            return datetime.strptime(s, '%Y-%m-%d').date()
-        except (ValueError, TypeError):
-            return None
-    
-    def parse_time(s):
-        try:
-            return datetime.strptime(s, '%H:%M').time()
-        except (ValueError, TypeError):
-            try:
-                return datetime.strptime(s, '%H:%M:%S').time()
-            except (ValueError, TypeError):
-                return None
-    
-    def wib_time_to_utc_time(t_obj):
-        if t_obj is None:
-            return None
-        wib_seconds = t_obj.hour * 3600 + t_obj.minute * 60 + t_obj.second
-        utc_seconds = (wib_seconds - 25200) % 86400
-        return (datetime.min + timedelta(seconds=utc_seconds)).time()
-    
-    # Get filter parameters
-    date_str = request.args.get('date')
-    time_str = request.args.get('time')
-    start_date_str = request.args.get('start_date')
-    end_date_str = request.args.get('end_date')
-    start_time_str = request.args.get('start_time')
-    end_time_str = request.args.get('end_time')
-    
-    # Validate paired parameters
-    if (start_date_str and not end_date_str) or (not start_date_str and end_date_str):
-        return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'INVALID_PARAMETER',
-                'message': 'Both start_date and end_date are required together'
-            }
-        }), 400
-    
-    if (start_time_str and not end_time_str) or (not start_time_str and end_time_str):
-        return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'INVALID_PARAMETER',
-                'message': 'Both start_time and end_time are required together'
-            }
-        }), 400
-    
-    # Build query
-    base_q = db.session.query(models.PredictionLog)
-    
-    if source == 'ecowitt':
-        base_q = base_q.filter(models.PredictionLog.weather_log_ecowitt_id.isnot(None))
-    else:
-        base_q = base_q.filter(models.PredictionLog.weather_log_wunderground_id.isnot(None))
-    
-    # Date/Time filter variables
-    filter_date_start_utc = None
-    filter_date_end_utc = None
-    filter_time_start_utc = None
-    filter_time_end_utc = None
-    use_date_range = False
-    use_time_filter = False
-    
-    # Process date filter
-    if date_str:
-        d = parse_date(date_str)
-        if not d:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'Invalid date format. Use YYYY-MM-DD'
-                }
-            }), 400
-        
-        dt_start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=WIB)
-        dt_end = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=WIB)
-        filter_date_start_utc = dt_start.astimezone(timezone.utc)
-        filter_date_end_utc = dt_end.astimezone(timezone.utc)
-        use_date_range = True
-    
-    elif start_date_str and end_date_str:
-        sd = parse_date(start_date_str)
-        ed = parse_date(end_date_str)
-        if not sd or not ed:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'Invalid date format. Use YYYY-MM-DD'
-                }
-            }), 400
-        if sd > ed:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'start_date must be before or equal to end_date'
-                }
-            }), 400
-        
-        dt_start = datetime(sd.year, sd.month, sd.day, 0, 0, 0, tzinfo=WIB)
-        dt_end = datetime(ed.year, ed.month, ed.day, 23, 59, 59, tzinfo=WIB)
-        filter_date_start_utc = dt_start.astimezone(timezone.utc)
-        filter_date_end_utc = dt_end.astimezone(timezone.utc)
-        use_date_range = True
-    
-    # Process time filter
-    if time_str:
-        t = parse_time(time_str)
-        if not t:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'Invalid time format. Use HH:MM'
-                }
-            }), 400
-        
-        if use_date_range and date_str:
-            # Combine date and time for exact match
-            d = parse_date(date_str)
-            spec_dt = datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=WIB)
-            spec_utc = spec_dt.astimezone(timezone.utc)
-            filter_date_start_utc = spec_utc
-            filter_date_end_utc = spec_utc
-            use_time_filter = False
-        else:
-            # Filter by time only (any date)
-            utc_t = wib_time_to_utc_time(t)
-            filter_time_start_utc = utc_t
-            filter_time_end_utc = utc_t
-            use_time_filter = True
-    
-    elif start_time_str and end_time_str:
-        st = parse_time(start_time_str)
-        et = parse_time(end_time_str)
-        if not st or not et:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'Invalid time format. Use HH:MM'
-                }
-            }), 400
-        
-        if date_str and st > et:
-            return jsonify({
-                'ok': False,
-                'error': {
-                    'code': 'INVALID_PARAMETER',
-                    'message': 'start_time must be before or equal to end_time when using single date'
-                }
-            }), 400
-        
-        filter_time_start_utc = wib_time_to_utc_time(st)
-        filter_time_end_utc = wib_time_to_utc_time(et)
-        use_time_filter = True
-    
-    # Apply date filter
-    if use_date_range:
-        if filter_date_start_utc == filter_date_end_utc:
-            base_q = base_q.filter(models.PredictionLog.created_at == filter_date_start_utc)
-        else:
-            base_q = base_q.filter(
-                models.PredictionLog.created_at >= filter_date_start_utc,
-                models.PredictionLog.created_at <= filter_date_end_utc
-            )
-    
-    # Apply time filter
-    if use_time_filter:
-        db_time = func.time(models.PredictionLog.created_at)
-        
-        if filter_time_start_utc == filter_time_end_utc:
-            base_q = base_q.filter(db_time == filter_time_start_utc)
-        else:
-            if filter_time_start_utc <= filter_time_end_utc:
-                base_q = base_q.filter(db_time.between(filter_time_start_utc, filter_time_end_utc))
-            else:
-                # Time range crosses midnight (e.g., 22:00 - 06:00)
-                base_q = base_q.filter(
-                    or_(db_time >= filter_time_start_utc, db_time <= filter_time_end_utc)
-                )
-    
-    # Get total and paginated results
-    total = base_q.count()
-    
-    pls = (
-        base_q.order_by(models.PredictionLog.created_at.desc())
-        .offset(offset)
-        .limit(per_page)
-        .all()
-    )
-    
-    # Build response data
-    from .services.prediction_service import get_label_from_db
-    
-    items = []
-    for p in pls:
-        wl = p.weather_log_ecowitt if source == 'ecowitt' else p.weather_log_wunderground
-        xgboost_result = p.ecowitt_predict_result if source == 'ecowitt' else p.wunderground_predict_result
-        
-        item = {
-            'id': p.id,
-            'timestamp': _to_wib_iso(p.created_at),
-            'classification': get_label_from_db(xgboost_result) if xgboost_result is not None else None,
-            'weather_summary': {
-                'temperature': getattr(wl, 'temperature_main_outdoor' if source == 'ecowitt' else 'temperature', None) if wl else None,
-                'humidity': getattr(wl, 'humidity_outdoor' if source == 'ecowitt' else 'humidity', None) if wl else None,
-                'rain_rate': getattr(wl, 'rain_rate' if source == 'ecowitt' else 'precipitation_rate', None) if wl else None,
-            }
-        }
-        items.append(item)
-    
-    return jsonify({
-        'ok': True,
-        'data': items,
-        'pagination': {
-            'page': page,
-            'per_page': per_page,
-            'total': total,
-            'total_pages': (total + per_page - 1) // per_page,
-            'has_next': page * per_page < total,
-            'has_prev': page > 1,
-        }
-    }), 200
-
+# =====================================================================
+# 6. GRAPH ENDPOINT
+# =====================================================================
 
 @bp_v3.route('/weather/graph', methods=['GET'])
-@apply_rate_limit
-@require_api_key
+@rate_limit
+@require_auth
+@strict_params('weather_graph')
 def weather_graph():
     """
-    Get data for weather graphs.
-    
-    Query Parameters:
-        - range: 'weekly' or 'monthly' (required)
-        - datatype: Data type to graph (required)
-          Options: temperature, humidity, rainfall, wind_speed, uvi, solar_radiation, relative_pressure
-        - source: 'ecowitt' (default) or 'wunderground'
-        - month: Month number 1-12 (for monthly range)
-    
-    Returns:
-        Time-series data for graphing
+    Get graph data.
+    Query params:
+        - range: weekly|monthly (required)
+        - datatype: temperature|humidity|rainfall|wind_speed|uvi|solar_radiation|relative_pressure (required)
+        - source: ecowitt|wunderground (default: ecowitt)
+        - month: 1-12 (for monthly, default: current month)
+        - year: YYYY (default: current year)
     """
+    # Validate range
     range_param = request.args.get('range')
     if not range_param:
-        return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'MISSING_PARAMETER',
-                'message': "Parameter 'range' is required (weekly or monthly)"
-            }
-        }), 400
+        return _error("MISSING_PARAMETER", "Query param 'range' is required (weekly or monthly)")
+    if range_param.lower() not in ('weekly', 'monthly'):
+        return _error("INVALID_PARAMETER", "Range must be 'weekly' or 'monthly'")
     
+    # Validate datatype
     datatype = request.args.get('datatype')
     if not datatype:
-        return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'MISSING_PARAMETER',
-                'message': "Parameter 'datatype' is required"
-            }
-        }), 400
+        return _error("MISSING_PARAMETER", "Query param 'datatype' is required")
     
-    source = request.args.get('source', 'ecowitt').lower()
-    month = request.args.get('month')
+    ALLOWED_DATATYPES = {
+        'temperature', 'humidity', 'rainfall', 'wind_speed', 
+        'uvi', 'solar_radiation', 'relative_pressure'
+    }
+    # Datatype validated by strict_params decorator using PARAM_SCHEMAS
     
-    payload = serializers.get_graph_payload(range_param, month=month, source=source, datatype=datatype)
+    # Validate source
+    source = request.args.get('source', 'ecowitt')
+    
+    # Validate month (for monthly)
+    month_raw = request.args.get('month')
+    if range_param.lower() == 'monthly':
+        if month_raw is None:
+            return _error("MISSING_PARAMETER", "Query param 'month' is required when range is 'monthly'")
+        if month_raw.strip() == '':
+            return _error("INVALID_PARAMETER", "Query param 'month' cannot be empty")
+            
+    # Validate year
+    year_raw = request.args.get('year')
+    if year_raw is not None:
+        if year_raw.strip() == '':
+             return _error("INVALID_PARAMETER", "Query param 'year' cannot be empty")
+        try:
+            int(year_raw)
+        except ValueError:
+            return _error("INVALID_PARAMETER", "Query param 'year' must be a valid integer")
+    
+    # Use serializers for graph logic
+    payload = serializers.get_graph_payload(
+        range_param=range_param,
+        month=month_raw,
+        year=year_raw,
+        source=source,
+        datatype=datatype
+    )
     
     if not payload.get('ok'):
+        return _error("INVALID_REQUEST", payload.get('message', 'Invalid request'))
+    
+    # Build params_applied
+    params_applied = {
+        "range": range_param.lower(),
+        "datatype": datatype
+    }
+    if request.args.get('source'):
+        params_applied["source"] = source
+    if month_raw:
+        params_applied["month"] = int(month_raw) if month_raw else None
+    if year_raw:
+        params_applied["year"] = int(year_raw)
+    
+    return jsonify({
+        "meta": _meta(source=source, extra={
+            "range": payload.get('range'),
+            "datatype": payload.get('datatype'),
+            "year": payload.get('year'),
+            "month": payload.get('month'),
+            "params_applied": params_applied
+        }),
+        "data": payload.get('data'),
+        "summary": payload.get('summary')
+    }), 200
+
+
+# =====================================================================
+# 7. CONSOLE DATA ENDPOINT (POST/GET) - RESTful v3
+# =====================================================================
+
+@bp_v3.route('/weather/console', methods=['POST', 'GET'])
+@rate_limit
+def weather_console():
+    """
+    Endpoint untuk menerima data dari Console Station.
+    No authentication required (for device compatibility).
+    
+    POST: Menerima data cuaca dari console station
+    GET: Juga didukung untuk kompatibilitas beberapa console
+    
+    Required fields: tempf, humidity, winddir, baromrelin
+    
+    Returns:
+        201: Data berhasil disimpan
+        400: No data / Invalid data / Missing required fields
+        500: Server error
+    """
+    waktu_terima = datetime.now(timezone.utc)
+    
+    logging.info(f"[Console] Data diterima pada {waktu_terima.isoformat()}")
+    
+    # Cek apakah Console endpoint aktif (env var: CONSOLE_ENDPOINT_ENABLED)
+    console_enabled = os.environ.get("CONSOLE_ENDPOINT_ENABLED", "true").lower() in ("1", "true", "yes")
+    if not console_enabled:
+        logging.info("[Console] Endpoint dinonaktifkan via CONSOLE_ENDPOINT_ENABLED")
         return jsonify({
-            'ok': False,
-            'error': {
-                'code': 'INVALID_REQUEST',
-                'message': payload.get('message', 'Invalid request')
-            }
+            "meta": _meta("error", 503),
+            "error": {
+                "code": "SERVICE_DISABLED",
+                "message": "Console endpoint is disabled"
+            },
+            "data": None
+        }), 503
+    
+    # Get data from POST form or GET query params
+    if request.method == 'POST':
+        raw_data = request.form.to_dict()
+    else:
+        raw_data = request.args.to_dict()
+    
+    if not raw_data:
+        logging.warning("[Console] Koneksi masuk tanpa data")
+        return jsonify({
+            "meta": _meta("error", 400),
+            "error": {
+                "code": "NO_DATA",
+                "message": "No data received"
+            },
+            "data": None
         }), 400
     
-    return jsonify(payload), 200
+    # =========================================================
+    # SECURITY CHECK (Mandatory — at least one method required)
+    # =========================================================
+    
+    whitelist_env = os.environ.get('CONSOLE_IP_WHITELIST')
+    console_key = os.environ.get('CONSOLE_KEY')
+    
+    # Enterprise Policy: Tolak semua request jika tidak ada metode auth yang dikonfigurasi
+    if not whitelist_env and not console_key:
+        logging.error("[Console] SECURITY: No auth configured (CONSOLE_IP_WHITELIST & CONSOLE_KEY both unset). Rejecting.")
+        return _error("SERVER_CONFIG", "Console authentication not configured", 503)
+    
+    # 1. IP Whitelist (jika dikonfigurasi)
+    if whitelist_env:
+        allowed_ips = [ip.strip() for ip in whitelist_env.split(',') if ip.strip()]
+        client_ip = request.remote_addr
+        if client_ip not in allowed_ips:
+            logging.warning(f"[Console] Blocked IP: {client_ip}")
+            return _error("FORBIDDEN", "Station IP not allowed", 403)
 
+    # 2. Key Authentication (jika dikonfigurasi)
+    if console_key:
+        # Check header, form/query 'key', or 'PASSKEY' (common in weather stations)
+        req_key = request.headers.get('X-CONSOLE-KEY') or raw_data.get('key') or raw_data.get('PASSKEY') or raw_data.get('CONSOLE_KEY')
+        
+        if not req_key or not hmac.compare_digest(req_key, console_key):
+            logging.warning(f"[Console] Auth failed from {request.remote_addr}")
+            return _error("UNAUTHORIZED", "Invalid Console Key", 401)
+    
+    # =========================================================
+    # FIELD VALIDATION
+    # =========================================================
+    
+    # Required fields for valid weather data
+    REQUIRED_FIELDS = ['tempf', 'humidity', 'winddir', 'baromrelin']
+    
+    # Check required fields
+    missing_fields = [f for f in REQUIRED_FIELDS if f not in raw_data or raw_data[f] == '']
+    if missing_fields:
+        logging.warning(f"[Console] Missing required fields: {missing_fields}")
+        return jsonify({
+            "meta": _meta("error", 400),
+            "error": {
+                "code": "MISSING_FIELDS",
+                "message": f"Missing required fields: {', '.join(missing_fields)}"
+            },
+            "data": None
+        }), 400
+    
+    # Validate numeric fields
+    NUMERIC_FIELDS = [
+        'tempf', 'humidity', 'winddir', 'baromrelin',
+        'tempinf', 'humidityin', 'baromabsin',
+        'windspeedmph', 'windgustmph', 'solarradiation', 'uv',
+        'rainratein', 'dailyrainin', 'hourlyrainin'
+    ]
+    
+    invalid_fields = []
+    for field in NUMERIC_FIELDS:
+        if field in raw_data and raw_data[field] != '':
+            try:
+                float(raw_data[field])
+            except (ValueError, TypeError):
+                invalid_fields.append(field)
+    
+    if invalid_fields:
+        logging.warning(f"[Console] Invalid numeric fields: {invalid_fields}")
+        return jsonify({
+            "meta": _meta("error", 400),
+            "error": {
+                "code": "INVALID_DATA_TYPE",
+                "message": f"Expected numeric values for: {', '.join(invalid_fields)}"
+            },
+            "data": None
+        }), 400
+    
+    # Range validation for key fields
+    try:
+        temp = float(raw_data.get('tempf', 0))
+        humidity = float(raw_data.get('humidity', 0))
+        winddir = float(raw_data.get('winddir', 0))
+        
+        # Temperature: -40°F to 140°F (-40°C to 60°C)
+        if temp < -40 or temp > 140:
+            return jsonify({
+                "meta": _meta("error", 400),
+                "error": {
+                    "code": "OUT_OF_RANGE",
+                    "message": f"Temperature out of range (-40 to 140°F): {temp}"
+                },
+                "data": None
+            }), 400
+        
+        # Humidity: 0-100%
+        if humidity < 0 or humidity > 100:
+            return jsonify({
+                "meta": _meta("error", 400),
+                "error": {
+                    "code": "OUT_OF_RANGE",
+                    "message": f"Humidity out of range (0-100%): {humidity}"
+                },
+                "data": None
+            }), 400
+        
+        # Wind direction: 0-360°
+        if winddir < 0 or winddir > 360:
+            return jsonify({
+                "meta": _meta("error", 400),
+                "error": {
+                    "code": "OUT_OF_RANGE",
+                    "message": f"Wind direction out of range (0-360°): {winddir}"
+                },
+                "data": None
+            }), 400
+            
+    except (ValueError, TypeError) as e:
+        return jsonify({
+            "meta": _meta("error", 400),
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": str(e)
+            },
+            "data": None
+        }), 400
+    
+    # Filter sensitive fields sebelum logging (PASSKEY, key, CONSOLE_KEY)
+    _SENSITIVE_FIELDS = {'PASSKEY', 'key', 'CONSOLE_KEY', 'passkey'}
+    safe_data = {k: ('***' if k in _SENSITIVE_FIELDS else v) for k, v in raw_data.items()}
+    logging.debug(f"[Console] Raw data: {safe_data}")
+    
+    try:
+        result = process_console_data(raw_data)
+        
+        if result:
+            logging.info(f"[Console] Data berhasil diproses (ID: {result.id})")
+            return jsonify({
+                "meta": _meta("success", 201),
+                "data": {
+                    "id": result.id,
+                    "timestamp": helpers.to_utc_iso(result.created_at)
+                }
+            }), 201
+        else:
+            logging.warning("[Console] Gagal memproses data")
+            return jsonify({
+                "meta": _meta("error", 500),
+                "error": {
+                    "code": "PROCESSING_FAILED",
+                    "message": "Failed to process console data"
+                },
+                "data": None
+            }), 500
+    
+    except Exception as e:
+        logging.error(f"[Console] Error: {e}")
+        db.session.rollback()
+        return jsonify({
+            "meta": _meta("error", 500),
+            "error": {
+                "code": "SERVER_ERROR",
+                "message": "Internal server error"
+            },
+            "data": None
+        }), 500
 
-# =====================================================================
-# ERROR HANDLERS
-# =====================================================================
-
-@bp_v3.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        'ok': False,
-        'error': {
-            'code': 'NOT_FOUND',
-            'message': 'The requested resource was not found'
-        }
-    }), 404
-
-
-@bp_v3.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'ok': False,
-        'error': {
-            'code': 'INTERNAL_ERROR',
-            'message': 'An internal server error occurred'
-        }
-    }), 500

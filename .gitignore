@@ -63,6 +63,14 @@ Thumbs.db
 
 .ipynb_checkpoints
 
+# Testing
+.pytest_cache/
+tests/__pycache__/
+tests/*.pyc
+.coverage
+htmlcov/
+.tox/
+
 *~
 *.swp
 instance/

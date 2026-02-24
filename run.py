@@ -1,68 +1,81 @@
+"""
+TUWS Backend - Main Entry Point
+=================================
+
+Aplikasi ini menjalankan:
+1. Flask RESTful API (v1/v2 legacy dan v3)
+2. Scheduler untuk fetch data cuaca (setiap 5 menit)
+3. Scheduler untuk prediksi (setiap jam pas)
+4. Endpoint untuk menerima data dari Console Station (POST)
+
+Urutan startup:
+1. Load environment variables
+2. Create Flask app
+3. Initialize ML models (XGBoost, LSTM, Scaler)
+4. Start scheduler dengan jobs
+5. Run Flask server
+"""
+
 from app import create_app, scheduler
 import os
 import logging
+from datetime import datetime, timezone, timedelta
 
 app = create_app()
 
-def _start_scheduler_and_jobs():
-    from datetime import datetime
-    # Import jobs here to avoid importing ML modules (tf/joblib) at module
-    # import time. This prevents ML libraries from being loaded during
-    # management commands like `flask db migrate` / `flask db upgrade`.
-    from app import jobs
-    
-    # Inisialisasi model ML saat startup
-    try:
-        from app.services.prediction_service import initialize_models
-        initialize_models()
-        logging.info("Model ML berhasil diinisialisasi saat startup.")
-    except Exception as e:
-        logging.warning(f"Gagal menginisialisasi model ML: {e}")
-    
-    try:
-        if not scheduler.running:
-            scheduler.start()
-        
-        # =====================================================
-        # Job 1: Fetch Weather Data (setiap 5 menit)
-        # =====================================================
-        if scheduler.get_job('fetch-weather'):
-            scheduler.remove_job('fetch-weather')
-        scheduler.add_job(
-            id='fetch-weather',
-            func=jobs.fetch_and_store_weather,
-            trigger='interval',
-            minutes=5,
-            next_run_time=datetime.now()
-        )
-        logging.info("Job 'fetch-weather' didaftarkan (interval 5 menit).")
-        
-        # =====================================================
-        # Job 2: Hourly Prediction (setiap jam, menit ke-00)
-        # =====================================================
-        if scheduler.get_job('hourly-prediction'):
-            scheduler.remove_job('hourly-prediction')
-        scheduler.add_job(
-            id='hourly-prediction',
-            func=jobs.run_hourly_prediction,
-            trigger='cron',
-            minute=0,  # Berjalan setiap jam di menit ke-00
-            next_run_time=datetime.now()  # Jalankan juga saat startup
-        )
-        logging.info("Job 'hourly-prediction' didaftarkan (setiap jam di menit ke-00).")
-        
-        logging.info("Scheduler dimulai dengan 2 jobs: fetch-weather (5 min) dan hourly-prediction (setiap jam).")
-    except Exception as e:
-        logging.warning(f"Gagal memulai scheduler atau menambah job: {e}")
 
 if __name__ == '__main__':
     debug = os.environ.get('FLASK_DEBUG', 'false').lower() in ('1', 'true', 'yes')
-    host = os.environ.get('FLASK_HOST', '127.0.0.1')
+    host = os.environ.get('FLASK_HOST', '0.0.0.0')  # Default listen semua interface
     port = int(os.environ.get('FLASK_PORT', '5000'))
 
-    disable_scheduler_for_tests = os.environ.get('DISABLE_SCHEDULER_FOR_TESTS', '').lower() in ('1', 'true', 'yes')
-    if not disable_scheduler_for_tests:
+    disable_scheduler = os.environ.get('DISABLE_SCHEDULER_FOR_TESTS', '').lower() in ('1', 'true', 'yes')
+    
+    if not disable_scheduler:
+        # Hindari double-start saat debug mode dengan reloader
         if (not debug) or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-            _start_scheduler_and_jobs()
+            # Initialize Cache/ML Models first (from old logic, but models are lazy loaded or inside init_scheduler?)
+            # Wait, run.py had custom logic for cache/models.
+            # We should preserve that or move it?
+            # Existing _start_scheduler_and_jobs had Steps 1-4.
+            # Step 1 (Cache) & Step 2 (Models) are good to have on startup.
+            # Step 3 (Scheduler) -> init_scheduler
+            # Step 4 (Fetch) -> init_scheduler(initial_fetch=True)
+            
+            # Let's import the extraction function if we want to clean up run.py completely, 
+            # OR just keep Cache/ML logic here and delegate Scheduler to init_scheduler.
+            
+            # Re-implement startup logic cleanly here:
+            logging.info("="*60)
+            logging.info("[STARTUP] Memulai TUWS Backend")
+            logging.info("="*60)
 
+            # 1. Cache
+            try:
+                from app.services.cache_service import get_cache_service
+                cache_svc = get_cache_service()
+                logging.info(f"[STARTUP] [OK] Cache service aktif (backend: {cache_svc.backend})")
+            except Exception as e:
+                logging.warning(f"[STARTUP] [!] Cache service error: {e}")
+
+            # 2. ML Models
+            try:
+                from app.services.prediction_service import initialize_models
+                logging.info("[STARTUP] Memuat model ML...")
+                initialize_models()
+                logging.info("[STARTUP] [OK] Model ML berhasil dimuat")
+            except Exception as e:
+                logging.warning(f"[STARTUP] [!] Gagal memuat model ML: {e}")
+
+            # 3. Scheduler (Start — no initial fetch, scheduler handles everything)
+            from app.scheduler_init import init_scheduler
+            init_scheduler(app, scheduler, start=True)
+            
+            logging.info("="*60)
+            logging.info("[STARTUP] TUWS Backend siap!")
+            logging.info("="*60)
+
+    logging.info(f"[SERVER] Flask berjalan di http://{host}:{port}")
+    logging.info(f"[SERVER] Debug mode: {debug}")
+    
     app.run(host=host, port=port, debug=debug, use_reloader=debug)

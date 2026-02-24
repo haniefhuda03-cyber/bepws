@@ -4,10 +4,31 @@ services:
     container_name: be_flask_tuws
     depends_on:
       - db
+      - redis
     ports:
       - "4046:5000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=mysql+pymysql://admin:adminTUWSPas@db:3306/tuws
     networks:
       - backend_tuws
+
+  redis:
+    image: redis:alpine
+    container_name: redis_tuws
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - backend_tuws
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   db:
     image: mysql:5.7
@@ -32,6 +53,7 @@ services:
 
 volumes:
   mysql:
+  redis_data:
 
 networks:
   backend_tuws:

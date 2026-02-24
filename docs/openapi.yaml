@@ -1,0 +1,1047 @@
+openapi: 3.0.3
+info:
+  title: TUWS Weather API
+  description: |
+    API cuaca publik untuk mendapatkan data cuaca real-time, prediksi, dan histori.
+    
+    ## Authentication
+    Semua endpoint (kecuali `/health` dan `/weather/console`) memerlukan header `X-APP-KEY`.
+    
+    ## Rate Limiting
+    - 100 request per menit per IP
+    - Headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+    
+    ## Data Sources
+    - **ecowitt**: Ecowitt weather station (metric units)
+    - **wunderground**: Weather Underground PWS (metric units)
+    
+    ## Caching
+    Semua GET endpoint (kecuali `/health`) menggunakan cache dual-layer (Redis primary + in-memory fallback):
+    - `/weather/current`: 60 detik
+    - `/weather/predict`: 300 detik (5 menit)
+    - `/weather/details`: 60 detik
+    - `/weather/history`: 120 detik (2 menit)
+    - `/weather/graph`: 300 detik (5 menit)
+  version: 3.0.1
+  contact:
+    name: TUWS API Support
+  license:
+    name: MIT
+    
+servers:
+  - url: /api/v3
+    description: Current server (relative URL)
+
+tags:
+  - name: Health
+    description: System health and status check
+  - name: Current Weather
+    description: Real-time weather data dari stasiun cuaca
+  - name: Predictions
+    description: Prediksi cuaca menggunakan model ML (XGBoost & LSTM)
+  - name: History
+    description: Data histori cuaca dengan pagination
+  - name: Console
+    description: Receiver data dari console station device
+
+components:
+  securitySchemes:
+    AppKeyAuth:
+      type: apiKey
+      in: header
+      name: X-APP-KEY
+      description: API key untuk authentication. Dapatkan dari administrator.
+
+  schemas:
+    Meta:
+      type: object
+      description: Metadata response standar
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+          example: success
+        code:
+          type: integer
+          example: 200
+        timestamp:
+          type: string
+          format: date-time
+          description: Waktu server saat response dibuat (UTC)
+          example: "2026-02-24T03:10:00.000000+00:00"
+        source:
+          type: string
+          enum: [ecowitt, wunderground]
+          nullable: true
+          description: Sumber data cuaca yang digunakan
+
+    Error:
+      type: object
+      description: Detail error
+      properties:
+        code:
+          type: string
+          description: Kode error machine-readable
+          example: INVALID_PARAMETER
+        message:
+          type: string
+          description: Pesan error human-readable
+          example: Invalid value for 'source'
+
+    ErrorResponse:
+      type: object
+      description: Response format saat terjadi error
+      properties:
+        meta:
+          $ref: '#/components/schemas/Meta'
+        error:
+          $ref: '#/components/schemas/Error'
+        data:
+          nullable: true
+          example: null
+      example:
+        meta:
+          status: error
+          code: 401
+          timestamp: "2026-02-24T03:10:00.000000+00:00"
+        error:
+          code: UNAUTHORIZED
+          message: "Missing or invalid X-APP-KEY header"
+        data: null
+
+    HealthData:
+      type: object
+      description: Informasi kesehatan sistem
+      properties:
+        api_version:
+          type: string
+          description: Versi API yang berjalan
+          example: v3
+        database:
+          type: string
+          enum: [connected, error]
+          description: Status koneksi database
+          example: connected
+        scheduler:
+          type: string
+          enum: [running, stopped, not_initialized, error]
+          description: Status APScheduler
+          example: running
+        jobs:
+          type: array
+          items:
+            type: string
+          description: Daftar job yang terdaftar
+          example: ["fetch-weather", "hourly-prediction-safety"]
+
+    CurrentWeatherData:
+      type: object
+      description: Data cuaca terkini dari stasiun
+      properties:
+        id:
+          type: integer
+          description: ID record di database
+          example: 69
+        timestamp:
+          type: string
+          format: date-time
+          description: Waktu data diambil (UTC)
+          example: "2026-02-24T03:10:01.369196+00:00"
+        temp:
+          type: number
+          format: float
+          description: Suhu dalam Celsius
+          example: 28.4
+        location:
+          type: string
+          description: Lokasi stasiun cuaca
+          example: Sukapura
+        humidity:
+          type: number
+          description: Kelembaban relatif (%)
+          example: 59.0
+        dew_point:
+          type: number
+          nullable: true
+          description: Titik embun dalam Celsius
+          example: 19.6
+        pressure:
+          type: number
+          description: Tekanan udara relatif (hPa)
+          example: 1012.6
+        precip_rate:
+          type: number
+          description: Intensitas hujan (mm/jam)
+          example: 0.0
+        wind_speed:
+          type: number
+          description: Kecepatan angin (m/s)
+          example: 1.0
+        wind_degree:
+          type: number
+          description: Arah angin dalam derajat (0-360)
+          example: 313.0
+        compass:
+          type: string
+          description: Arah angin dalam kompas
+          example: NW
+
+    PredictionXGBoost:
+      type: object
+      description: Hasil prediksi XGBoost — prediksi arah hujan
+      properties:
+        id:
+          type: integer
+          description: ID record prediksi
+          example: 42
+        timestamp:
+          type: string
+          format: date-time
+          description: Waktu prediksi dibuat
+          example: "2026-02-24T03:00:00.000000+00:00"
+        time_target_predict:
+          type: string
+          description: Jam target prediksi (WIB)
+          example: "10:00"
+        date_target_predict:
+          type: string
+          description: Tanggal target prediksi (DD-MM-YY)
+          example: "24-02-26"
+        temp:
+          type: number
+          nullable: true
+          description: Suhu saat prediksi (°C)
+          example: 28.4
+        weather_predict:
+          type: string
+          description: Label prediksi arah hujan
+          example: Cerah / Berawan
+
+    PredictionLSTM:
+      type: object
+      description: Hasil prediksi LSTM — prediksi intensitas hujan per jam
+      properties:
+        id:
+          type: integer
+          description: ID record prediksi
+          example: 101
+        timestamp:
+          type: string
+          format: date-time
+          description: Waktu prediksi dibuat
+          example: "2026-02-24T03:00:00.000000+00:00"
+        time_target_predict:
+          type: string
+          description: Jam target prediksi (WIB)
+          example: "11:00"
+        date_target_predict:
+          type: string
+          description: Tanggal target prediksi (DD-MM-YY)
+          example: "24-02-26"
+        temp:
+          type: number
+          nullable: true
+          description: Suhu prediksi (°C)
+          example: 29.1
+        weather_predict:
+          type: number
+          description: Intensitas hujan prediksi (mm/jam)
+          example: 0.125
+
+    DetailsData:
+      type: object
+      description: Data cuaca detail termasuk VPD, UV index, dan solar irradiance
+      properties:
+        id:
+          type: integer
+          example: 69
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-02-24T03:10:01.369196+00:00"
+        vpd_outdoor:
+          type: number
+          nullable: true
+          description: Vapor Pressure Deficit (kPa)
+          example: 1.42
+        feels_like:
+          type: number
+          nullable: true
+          description: Suhu terasa (°C)
+          example: 30.2
+        uvi:
+          type: number
+          description: UV Index (0-15)
+          example: 5.0
+        solar_irradiance:
+          type: number
+          description: Intensitas cahaya matahari (lux)
+          example: 12670.0
+        wind_gust:
+          type: number
+          description: Hembusan angin maksimum (m/s)
+          example: 3.5
+        pressure_relative:
+          type: number
+          description: Tekanan udara relatif (hPa)
+          example: 1012.6
+
+    HistoryItem:
+      type: object
+      description: Satu record data histori cuaca
+      properties:
+        id:
+          type: integer
+          example: 55
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-02-23T10:00:00.000000+00:00"
+        temp:
+          type: number
+          description: Suhu (°C)
+          example: 27.8
+        humidity:
+          type: number
+          description: Kelembaban (%)
+          example: 72.0
+        pressure:
+          type: number
+          description: Tekanan udara (hPa)
+          example: 1013.2
+        rain_rate:
+          type: number
+          description: Intensitas hujan (mm/jam)
+          example: 0.0
+        wind_speed:
+          type: number
+          description: Kecepatan angin (m/s)
+          example: 2.1
+        wind_dir:
+          type: number
+          description: Arah angin (derajat)
+          example: 180.0
+
+    Pagination:
+      type: object
+      description: Informasi pagination untuk response berbentuk list
+      properties:
+        page:
+          type: integer
+          description: Halaman saat ini
+          example: 1
+        per_page:
+          type: integer
+          description: Jumlah item per halaman
+          example: 5
+        total:
+          type: integer
+          description: Total item tersedia
+          example: 100
+        total_pages:
+          type: integer
+          description: Total halaman
+          example: 20
+        has_next:
+          type: boolean
+          description: Apakah ada halaman selanjutnya
+          example: true
+        has_prev:
+          type: boolean
+          description: Apakah ada halaman sebelumnya
+          example: false
+
+  parameters:
+    SourceParam:
+      name: source
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [ecowitt, wunderground]
+        default: ecowitt
+      description: Sumber data cuaca. Default ecowitt.
+
+    ModelParam:
+      name: model
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [lstm, xgboost]
+        default: lstm
+      description: Model ML untuk prediksi. LSTM untuk intensitas hujan, XGBoost untuk arah hujan.
+
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 24
+        default: 12
+      description: Jumlah prediksi (hanya untuk LSTM, 1-24 jam ke depan)
+
+    PageParam:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      description: Nomor halaman
+
+    PerPageParam:
+      name: per_page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 10
+        default: 5
+      description: Jumlah item per halaman (maks 10)
+
+    StartDateParam:
+      name: start_date
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+      description: "Filter mulai dari tanggal (ISO 8601). Contoh: 2026-02-01T00:00:00Z"
+
+    EndDateParam:
+      name: end_date
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+      description: "Filter sampai tanggal (ISO 8601). Contoh: 2026-02-28T23:59:59Z"
+
+    SortParam:
+      name: sort
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [newest, oldest]
+        default: newest
+      description: Urutan data. newest = terbaru dulu, oldest = terlama dulu.
+
+    RangeParam:
+      name: range
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [weekly, monthly]
+      description: Rentang waktu grafik. weekly = 7 hari terakhir, monthly = 1 bulan.
+
+    DatatypeParam:
+      name: datatype
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [temperature, humidity, rainfall, wind_speed, uvi, solar_radiation, relative_pressure]
+      description: Jenis data yang ditampilkan di grafik
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: |
+        Cek status API, database, dan scheduler.
+        
+        **Tidak memerlukan authentication.**
+      operationId: getHealth
+      responses:
+        '200':
+          description: Sistem berjalan normal
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+                  data:
+                    $ref: '#/components/schemas/HealthData'
+              example:
+                meta:
+                  status: success
+                  code: 200
+                  timestamp: "2026-02-24T03:11:26.086396+00:00"
+                data:
+                  api_version: v3
+                  database: connected
+                  scheduler: running
+                  jobs: ["fetch-weather", "hourly-prediction-safety"]
+        '429':
+          description: Rate limit terlampaui
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /weather/current:
+    get:
+      tags: [Current Weather]
+      summary: Data cuaca terkini
+      description: |
+        Mengembalikan data cuaca terbaru dari sumber yang dipilih.
+        
+        **Fields yang dikembalikan:**
+        - `temp` — Suhu (°C)
+        - `humidity` — Kelembaban (%)
+        - `pressure` — Tekanan udara (hPa)
+        - `precip_rate` — Intensitas hujan (mm/jam)
+        - `wind_speed` — Kecepatan angin (m/s)
+        - `wind_degree` — Arah angin (derajat)
+        - `compass` — Arah angin (kompas: N, NE, E, SE, S, SW, W, NW)
+        - `dew_point` — Titik embun (°C)
+      operationId: getCurrentWeather
+      security:
+        - AppKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceParam'
+      responses:
+        '200':
+          description: Data cuaca berhasil diambil
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+                  data:
+                    $ref: '#/components/schemas/CurrentWeatherData'
+              example:
+                meta:
+                  status: success
+                  code: 200
+                  source: ecowitt
+                  timestamp: "2026-02-24T03:11:28.455485+00:00"
+                data:
+                  id: 69
+                  timestamp: "2026-02-24T03:10:01.369196+00:00"
+                  temp: 28.4
+                  location: Sukapura
+                  humidity: 59.0
+                  dew_point: 19.6
+                  pressure: 1012.6
+                  precip_rate: 0.0
+                  wind_speed: 1.0
+                  wind_degree: 313.0
+                  compass: NW
+        '401':
+          description: X-APP-KEY tidak ada atau tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                meta:
+                  status: error
+                  code: 401
+                  timestamp: "2026-02-24T03:11:28.000000+00:00"
+                error:
+                  code: UNAUTHORIZED
+                  message: "Missing or invalid X-APP-KEY header"
+                data: null
+        '400':
+          description: Parameter tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                meta:
+                  status: error
+                  code: 400
+                  timestamp: "2026-02-24T03:11:28.000000+00:00"
+                error:
+                  code: INVALID_PARAMETER
+                  message: "Invalid source 'xyz'. Choose: ecowitt, wunderground"
+                data: null
+        '404':
+          description: Belum ada data cuaca tersedia
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                meta:
+                  status: error
+                  code: 404
+                  source: ecowitt
+                  timestamp: "2026-02-24T03:11:28.000000+00:00"
+                error:
+                  code: NOT_FOUND
+                  message: "No weather data available for ecowitt"
+                data: null
+
+  /weather/predict:
+    get:
+      tags: [Predictions]
+      summary: Prediksi cuaca
+      description: |
+        Mengembalikan prediksi cuaca menggunakan model ML.
+        
+        **Model yang tersedia:**
+        - **XGBoost** — Prediksi arah datangnya hujan (9 kelas). Mengembalikan 1 prediksi tunggal.
+        - **LSTM** — Prediksi intensitas hujan dalam mm/jam. Mengembalikan array 1-24 prediksi per jam ke depan.
+        
+        **Parameter `limit`** hanya berlaku untuk LSTM (default 12, maks 24).
+      operationId: getWeatherPredictions
+      security:
+        - AppKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceParam'
+        - $ref: '#/components/parameters/ModelParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Hasil prediksi
+          content:
+            application/json:
+              examples:
+                xgboost:
+                  summary: Prediksi XGBoost — arah hujan
+                  value:
+                    meta:
+                      status: success
+                      code: 200
+                      source: ecowitt
+                      timestamp: "2026-02-24T03:00:00.000000+00:00"
+                    data:
+                      id: 42
+                      timestamp: "2026-02-24T03:00:00.000000+00:00"
+                      time_target_predict: "10:00"
+                      date_target_predict: "24-02-26"
+                      temp: 28.4
+                      weather_predict: "Cerah / Berawan"
+                lstm:
+                  summary: Prediksi LSTM — intensitas hujan per jam
+                  value:
+                    meta:
+                      status: success
+                      code: 200
+                      source: ecowitt
+                      timestamp: "2026-02-24T03:00:00.000000+00:00"
+                    data:
+                      - id: 101
+                        timestamp: "2026-02-24T03:00:00.000000+00:00"
+                        time_target_predict: "11:00"
+                        date_target_predict: "24-02-26"
+                        temp: 29.1
+                        weather_predict: 0.125
+                      - id: 102
+                        timestamp: "2026-02-24T03:00:00.000000+00:00"
+                        time_target_predict: "12:00"
+                        date_target_predict: "24-02-26"
+                        temp: 30.5
+                        weather_predict: 0.342
+              schema:
+                type: object
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+                  data:
+                    oneOf:
+                      - $ref: '#/components/schemas/PredictionXGBoost'
+                      - type: array
+                        items:
+                          $ref: '#/components/schemas/PredictionLSTM'
+        '401':
+          description: X-APP-KEY tidak ada atau tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Belum ada data prediksi tersedia
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                meta:
+                  status: error
+                  code: 404
+                  source: ecowitt
+                  timestamp: "2026-02-24T03:00:00.000000+00:00"
+                error:
+                  code: NOT_FOUND
+                  message: "No prediction data available"
+                data: null
+
+  /weather/details:
+    get:
+      tags: [Current Weather]
+      summary: Data cuaca detail
+      description: |
+        Mengembalikan data cuaca detail termasuk:
+        - **VPD** — Vapor Pressure Deficit (kPa)
+        - **Feels Like** — Suhu terasa (°C)
+        - **UV Index** — Indeks ultraviolet (0-15)
+        - **Solar Irradiance** — Intensitas cahaya matahari (lux)
+        - **Wind Gust** — Hembusan angin maksimum (m/s)
+      operationId: getWeatherDetails
+      security:
+        - AppKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceParam'
+      responses:
+        '200':
+          description: Data cuaca detail berhasil diambil
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+                  data:
+                    $ref: '#/components/schemas/DetailsData'
+              example:
+                meta:
+                  status: success
+                  code: 200
+                  source: ecowitt
+                  timestamp: "2026-02-24T03:11:28.000000+00:00"
+                data:
+                  id: 69
+                  timestamp: "2026-02-24T03:10:01.369196+00:00"
+                  vpd_outdoor: 1.42
+                  feels_like: 30.2
+                  uvi: 5.0
+                  solar_irradiance: 12670.0
+                  wind_gust: 3.5
+                  pressure_relative: 1012.6
+        '401':
+          description: X-APP-KEY tidak ada atau tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Belum ada data tersedia
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /weather/history:
+    get:
+      tags: [History]
+      summary: Histori cuaca
+      description: |
+        Mengembalikan data histori cuaca dengan **pagination**.
+        
+        Mendukung filter berdasarkan:
+        - **start_date** / **end_date** — Rentang waktu (ISO 8601)
+        - **sort** — Urutan data (newest / oldest)
+        - **page** / **per_page** — Pagination
+        
+        Cache: 120 detik (2 menit).
+      operationId: getWeatherHistory
+      security:
+        - AppKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+        - $ref: '#/components/parameters/StartDateParam'
+        - $ref: '#/components/parameters/EndDateParam'
+        - $ref: '#/components/parameters/SortParam'
+      responses:
+        '200':
+          description: Data histori cuaca
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HistoryItem'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+              example:
+                meta:
+                  status: success
+                  code: 200
+                  source: ecowitt
+                  timestamp: "2026-02-24T03:15:00.000000+00:00"
+                data:
+                  - id: 69
+                    timestamp: "2026-02-24T03:10:01.000000+00:00"
+                    temp: 28.4
+                    humidity: 59.0
+                    pressure: 1012.6
+                    rain_rate: 0.0
+                    wind_speed: 1.0
+                    wind_dir: 313.0
+                  - id: 68
+                    timestamp: "2026-02-24T03:05:01.000000+00:00"
+                    temp: 28.2
+                    humidity: 60.0
+                    pressure: 1012.8
+                    rain_rate: 0.0
+                    wind_speed: 0.8
+                    wind_dir: 300.0
+                pagination:
+                  page: 1
+                  per_page: 5
+                  total: 69
+                  total_pages: 14
+                  has_next: true
+                  has_prev: false
+        '401':
+          description: X-APP-KEY tidak ada atau tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /weather/graph:
+    get:
+      tags: [History]
+      summary: Data untuk grafik
+      description: |
+        Mengembalikan data yang diagregasi per hari untuk ditampilkan di grafik.
+        
+        **Parameter wajib:**
+        - `range` — `weekly` (7 hari) atau `monthly` (1 bulan)
+        - `datatype` — Jenis data (temperature, humidity, rainfall, dll)
+        
+        **Response mengandung:**
+        - `summary` — Ringkasan (rata-rata, min, max, total)
+        - `graph` — Array data per hari
+      operationId: getGraphData
+      security:
+        - AppKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RangeParam'
+        - $ref: '#/components/parameters/DatatypeParam'
+        - $ref: '#/components/parameters/SourceParam'
+        - name: month
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 12
+          description: Filter bulan (untuk range monthly)
+      responses:
+        '200':
+          description: Data grafik
+          content:
+            application/json:
+              example:
+                meta:
+                  status: success
+                  code: 200
+                  source: ecowitt
+                  timestamp: "2026-02-24T03:15:00.000000+00:00"
+                data:
+                  summary:
+                    avg: 27.5
+                    min: 24.1
+                    max: 32.8
+                    data_status: complete
+                  graph:
+                    - date: "2026-02-23"
+                      avg: 27.5
+                      min: 24.1
+                      max: 32.8
+                      data_count: 288
+                      status: complete
+                    - date: "2026-02-24"
+                      avg: 28.0
+                      min: 25.2
+                      max: 31.5
+                      data_count: 150
+                      status: partial
+              schema:
+                type: object
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+                  data:
+                    type: object
+                    properties:
+                      summary:
+                        type: object
+                        description: Ringkasan data (avg, min, max)
+                      graph:
+                        type: array
+                        description: Data per hari
+                        items:
+                          type: object
+                          properties:
+                            date:
+                              type: string
+                              description: Tanggal (YYYY-MM-DD)
+                            avg:
+                              type: number
+                            min:
+                              type: number
+                            max:
+                              type: number
+                            data_count:
+                              type: integer
+                            status:
+                              type: string
+                              enum: [complete, partial, no_data, future]
+        '401':
+          description: X-APP-KEY tidak ada atau tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /weather/console:
+    post:
+      tags: [Console]
+      summary: Terima data console (POST)
+      description: |
+        Endpoint untuk menerima data cuaca dari perangkat console station.
+        
+        **Tidak memerlukan authentication** (untuk kompatibilitas device).
+        
+        Data disimpan dalam **Imperial units** sesuai format yang dikirim device.
+      operationId: postConsoleData
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - tempf
+                - humidity
+                - winddir
+                - baromrelin
+              properties:
+                tempf:
+                  type: number
+                  description: Suhu (°F)
+                  example: 82.4
+                humidity:
+                  type: number
+                  description: Kelembaban (%)
+                  example: 75.0
+                winddir:
+                  type: number
+                  description: Arah angin (°)
+                  example: 180
+                baromrelin:
+                  type: number
+                  description: Tekanan barometrik relatif (inHg)
+                  example: 29.92
+                windspeedmph:
+                  type: number
+                  description: Kecepatan angin (mph)
+                  example: 5.0
+                solarradiation:
+                  type: number
+                  description: Radiasi matahari (W/m²)
+                  example: 100.5
+                rainratein:
+                  type: number
+                  description: Intensitas hujan (in/hr)
+                  example: 0.0
+                dateutc:
+                  type: string
+                  description: "Timestamp UTC (format: YYYY-MM-DD HH:MM:SS)"
+                  example: "2026-02-24 03:00:00"
+      responses:
+        '201':
+          description: Data berhasil disimpan
+          content:
+            application/json:
+              example:
+                meta:
+                  status: success
+                  code: 201
+                  timestamp: "2026-02-24T03:00:00.000000+00:00"
+                data:
+                  id: 3
+                  timestamp: "2026-02-24T03:00:00.000000+00:00"
+              schema:
+                type: object
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        description: ID record yang tersimpan
+                      timestamp:
+                        type: string
+                        format: date-time
+        '400':
+          description: Data tidak valid atau tidak lengkap
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                meta:
+                  status: error
+                  code: 400
+                  timestamp: "2026-02-24T03:00:00.000000+00:00"
+                error:
+                  code: MISSING_FIELD
+                  message: "Required fields missing: tempf, humidity"
+                data: null
+    get:
+      tags: [Console]
+      summary: Terima data console (GET)
+      description: |
+        Alternatif GET method untuk menerima data console. Sama seperti POST.
+        
+        Beberapa weather station device mengirim data via GET query string.
+      operationId: getConsoleData
+      parameters:
+        - name: tempf
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Suhu (°F)
+        - name: humidity
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Kelembaban (%)
+        - name: winddir
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Arah angin (°)
+        - name: baromrelin
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Tekanan barometrik (inHg)
+      responses:
+        '201':
+          description: Data berhasil disimpan
+        '400':
+          description: Data tidak valid atau tidak lengkap

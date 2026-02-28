@@ -3,15 +3,18 @@ services:
     build: .
     container_name: be_flask_tuws
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
     ports:
-      - "4046:5000"
+      - "5000:5000"
+    env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - DATABASE_URL=mysql+pymysql://admin:adminTUWSPas@db:3306/tuws
+      - TZ=Asia/Jakarta
     networks:
       - backend_tuws
+    restart: unless-stopped
 
   redis:
     image: redis:alpine
@@ -22,6 +25,8 @@ services:
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+    environment:
+      - TZ=Asia/Jakarta
     networks:
       - backend_tuws
     healthcheck:
@@ -31,28 +36,28 @@ services:
       retries: 5
 
   db:
-    image: mysql:5.7
+    image: postgres:15-alpine
     restart: always
-    container_name: db_mysql_tuws
+    container_name: db_postgres_tuws
     environment:
-      MYSQL_DATABASE: tuws
-      MYSQL_USER: admin
-      MYSQL_PASSWORD: adminTUWSPas
-      MYSQL_ROOT_PASSWORD: rootPasTUWS
+      POSTGRES_DB: tuws_prod_db
+      POSTGRES_USER: tuws_prod
+      POSTGRES_PASSWORD: TuwsSecretPassword!
+      TZ: Asia/Jakarta
     ports:
-      - "3050:3306"
+      - "5432:5432"
     volumes:
-      - mysql:/var/lib/mysql
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uadmin", "-pdbPasswordTUWS"]
-      timeout: 20s
-      retries: 10
-      start_period: 30s
+      test: ["CMD-SHELL", "pg_isready -U tuws_prod -d tuws_prod_db -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - backend_tuws
 
 volumes:
-  mysql:
+  postgres_data:
   redis_data:
 
 networks:

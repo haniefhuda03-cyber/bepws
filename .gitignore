@@ -1,77 +1,32 @@
-__pycache__/
-*.py[cod]
-*$py.class
+# Mengabaikan File Rahasia Lokal
+.env
 
-*.so
-
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-pip-wheel-metadata/
-share/python-wheels/
-
-venv/
+# Virtual Environment Lokal (Windows/Mac)
 .venv/
-ENV/
+venv/
 env/
-env.bak/
-venv.bak/
 
-pip-log.txt
-pip-delete-this-directory.txt
-
-.tox/
-*.cover
-*.coverage
-.coverage.*
-.cache
+# Cache, Compiled Python, & Logs
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/*.pyc
 .pytest_cache/
-
 logs/
 *.log
 
-.env
-.env.*
-
-instance/
-instance/*
-!instance/.gitkeep
-
-*.sqlite3
-*.db
-*.db-journal
-
+# IDE & Workspaces
+workspace/
+my-tuws/
 .vscode/
 .idea/
-*.sublime-project
-*.sublime-workspace
 
+# Flask Instance (contains secret keys, local DB dll)
+instance/
+
+# Unit Tests Frame (Optional jika tidak di-push)
+tests/
+
+# Operating System Files
 .DS_Store
 Thumbs.db
-
-*.pyc
-
-.ipynb_checkpoints
-
-# Testing
-.pytest_cache/
-tests/__pycache__/
-tests/*.pyc
-.coverage
-htmlcov/
-.tox/
-
-*~
-*.swp
-instance/
-.secret_key

@@ -262,7 +262,43 @@ GET /api/v3/weather/history?start_date=2026-02-01T00:00:00+07:00&end_date=2026-0
 
 ---
 
+## 🚀 Production Deployment (VPS / Cloud)
+
+Untuk melakukan deployment ke _production_ (seperti VPS Hostinger, AWS, DigitalOcean), sangat disarankan menggunakan **Docker**. Projek ini telah didesain dengan arsitektur _production grade_: **Gunicorn (WSGI) + PostgreSQL 15 + Redis**.
+
+### 1. Persiapan Server
+1. Pastikan VPS Anda ter-install `docker` dan `docker-compose`.
+2. _Clone_ repositori ini ke VPS Anda.
+
+### 2. Mulai Deployment
+Di dalam direktori proyek pada VPS, jalankan:
+```bash
+# 1. Salin template khusus production
+$ cp .env.production .env
+
+# 2. Edit konfigurasi di file .env
+$ nano .env
+# PENTING JANGAN LUPA:
+# - Ganti password DATABASE_URL dengan yang sangat kuat
+# - Ganti SECRET_KEY dengan kombinasi 32 huruf+angka acak
+# - Isi WUNDERGROUND_URL dan ECO_APP_KEY/ECO_API_KEY
+# - Pastikan AUTO_MIGRATE=1 (untuk pembuatan tabel otomatis)
+
+# 3. Jalankan Docker Compose
+$ docker-compose up -d --build
+```
+
+**Docker otomatis menjalankan 3 _containers_:**
+1. `db_postgres_tuws`: Database PostgreSQL 15.
+2. `redis_tuws`: Redis Server (Caching & Rate Limiting).
+3. `be_flask_tuws`: Aplikasi Backend TUWS_BE (Gunicorn WSGI).
+
+> **💡 Tips Nginx / SSL:** Backend berjalan di port VPS internal `5000`. Jika menggunakan HTTPS, instal Nginx di VPS Anda, pasang sertifikat Let's Encrypt, dan buat _Reverse Proxy_ ke arah `http://127.0.0.1:5000`.
+
+---
+
 ## 🔄 Perintah Migrasi Database
+
 
 ```bash
 flask db current           # Status migrasi saat ini

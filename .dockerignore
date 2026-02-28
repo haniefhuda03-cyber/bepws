@@ -1,5 +1,39 @@
-__pycache__
-.venv
-**/__pycache__
+# Mengabaikan File Rahasia Lokal & Template (Biar ukuran Image Kecil)
+.env
+.env.example
+.env.production
 
-logs
+# Virtual Environment Lokal (Windows/Mac)
+.venv/
+venv/
+env/
+
+# Cache, Compiled Python, & Logs
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/*.pyc
+.pytest_cache/
+logs/
+*.log
+
+# IDE & Workspaces
+workspace/
+my-tuws/
+.vscode/
+.idea/
+
+# Flask Instance (contains secret keys, local DB dll)
+instance/
+
+# Unit Tests Frame
+tests/
+
+# Khusus Docker Server: Mencegah sampah Git dan Konfigurasi masuk OS Image Server
+.git/
+.gitignore
+.dockerignore
+
+# Operating System Files
+.DS_Store
+Thumbs.db

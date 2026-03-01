@@ -392,7 +392,7 @@ Get aggregated data for graphs. Data diagregasi **per hari WIB** (bukan UTC). Li
 | `range` | string | **Yes** | Time range: `weekly` or `monthly`. |
 | `datatype` | string | **Yes** | Type of data to graph. |
 | `source` | string | No | Data source. Default: `ecowitt`. |
-| `month` | int | **Yes** (monthly) | Bulan (1-12). Wajib jika `range=monthly`. |
+| `month` | int | **Yes** (monthly) | Bulan (1-12). Wajib jika `range=monthly`. **Di-banned jika `range=weekly`.** |
 
 **Allowed Datatypes**:
 `temperature`, `humidity`, `rainfall`, `wind_speed`, `uvi`, `solar_radiation`, `relative_pressure`.

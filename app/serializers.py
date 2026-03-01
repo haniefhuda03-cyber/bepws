@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 import calendar
 from collections import defaultdict
 from typing import Optional, List, Dict, Any
+import os
 
 from sqlalchemy.orm import joinedload, load_only
 from sqlalchemy import func as sa_func
@@ -289,7 +290,7 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
                 "id": wl.id,
                 "timestamp": helpers.to_utc_iso(wl.created_at),
                 "temp": wl.temperature_main_outdoor,
-                "location": models.LOCATION if hasattr(models, 'LOCATION') else "Unknown",
+                "location": os.environ.get('STATION_LOCATION', 'Unknown'),
                 "humidity": wl.humidity_outdoor,
                 "dew_point": wl.dew_point_outdoor,
                 "pressure": wl.pressure_relative,
@@ -316,7 +317,7 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
                 "id": wl.id,
                 "timestamp": helpers.to_utc_iso(wl.created_at),
                 "temp": wl.temperature,
-                "location": models.LOCATION if hasattr(models, 'LOCATION') else "Unknown",
+                "location": os.environ.get('STATION_LOCATION', 'Unknown'),
                 "humidity": wl.humidity,
                 "dew_point": None,
                 "pressure": wl.pressure,

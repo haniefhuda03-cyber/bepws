@@ -54,8 +54,6 @@ WIB = timezone(timedelta(hours=7))
 # CONSTANTS
 # =====================================================================
 
-LOCATION = "Sukapura"  # dari neighborhood Wunderground
-
 # =====================================================================
 # RATE LIMITER (In-Memory, Thread-Safe)
 # =====================================================================
@@ -359,7 +357,7 @@ def strict_params(endpoint_name):
             
             # Validate each provided param
             for param, value in request.args.items():
-                # Check empty values first
+                # Check empty values
                 if value.strip() == '':
                     return _error(
                         "INVALID_PARAMETER",
@@ -378,7 +376,6 @@ def strict_params(endpoint_name):
                 schema = PARAM_SCHEMAS.get(param)
                 if not schema:
                     continue
-
                 
                 # Type validation
                 if schema['type'] == 'enum':
@@ -577,14 +574,17 @@ def weather_predict():
     # Validate limit
     limit_raw = request.args.get('limit')
     limit = 12
+
+    if model == 'xgboost' and limit_raw is not None:
+         return _error("INVALID_PARAMETER", "Limit not allowed for XGBoost")
+
     if limit_raw is not None:
         try:
             limit = int(limit_raw)
         except ValueError:
-            return _error("INVALID_PARAMETER", "Limit must be valid integer")
-            
-    if model == 'xgboost' and limit_raw is not None:
-         return _error("INVALID_PARAMETER", "Limit not allowed for XGBoost")
+            return _error("INVALID_PARAMETER", "Limit must be a valid integer")
+
+    
          
     # Call Serializer
     # Helper: get_prediction_payload returns a list.
@@ -884,6 +884,8 @@ def weather_graph():
     if range_param.lower() == 'monthly':
         if month_raw is None:
             return _error("MISSING_PARAMETER", "Query param 'month' is required when range is 'monthly'")
+        if month_raw.strip() == '':
+            return _error("INVALID_PARAMETER", "Query param 'month' cannot be empty")
     else:
         if month_raw is not None:
             return _error("INVALID_PARAMETER", "Query param 'month' is only allowed when range is 'monthly'")

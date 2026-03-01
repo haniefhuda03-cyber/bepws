@@ -535,8 +535,9 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
             ModelClass = WeatherLogWunderground
             order_column = ModelClass.request_time
         
-        # Ambil data lebih banyak untuk antisipasi gap
-        buffer_size = SEQUENCE_LENGTH + 100  # Lebih banyak untuk handle gaps
+        # Ambil data sedikit lebih banyak (buffer) untuk mengantisipasi gap ringan
+        # (Misal telat fetch 1-2 interval). +10 berarti buffer 50 menit
+        buffer_size = SEQUENCE_LENGTH + 10
         
         # Load only columns needed for LSTM features
         if source == 'ecowitt':

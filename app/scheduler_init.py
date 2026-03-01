@@ -77,6 +77,7 @@ def init_scheduler(app, scheduler, start=True):
             next_run_time=next_fetch,
             max_instances=1,   # Cegah overlapping runs
             coalesce=True,     # Jika missed, jalankan hanya sekali
+            misfire_grace_time=60, # Tolelir keterlambatan hingga 60 detik
         )
         logging.info(f"[Scheduler] Job 'fetch-weather' registered. Next: {next_fetch.astimezone(wib).strftime('%H:%M:%S')} WIB")
         
@@ -98,8 +99,11 @@ def init_scheduler(app, scheduler, start=True):
             minute=8,
             second=0,
             timezone=timezone.utc,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60, # Tolelir keterlambatan hingga 60 detik
         )
-        logging.info(f"[Scheduler] Job 'hourly-prediction-safety' registered (safety net, setiap jam menit ke-8)")
+        logging.info("[Scheduler] Job 'hourly-prediction-safety' (Backup Prediction) registered at minute 8 every hour (safety net, setiap jam menit ke-8).")
         logging.info(f"[Scheduler] PRIMARY: Prediction dipicu event-driven oleh fetch-weather pada jam pas")
         logging.info(f"[Scheduler] SAFETY:  Jika primary gagal, safety net akan menjalankan prediksi di menit ke-8")
         

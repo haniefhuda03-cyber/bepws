@@ -319,8 +319,8 @@ Get paginated historical weather data with filtering and sorting by `created_at`
 
 > **Validation Rules:**
 > - `start_date` and `end_date` must be valid ISO 8601 datetime strings.
-> - If both are provided, `start_date` must be earlier than or equal to `end_date`.
-> - Either one can be used alone (open-ended range).
+> - `start_date` and `end_date` **MUST be provided together**. You cannot use only one of them.
+> - `start_date` must be earlier than or equal to `end_date`.
 > - `sort` only accepts `newest` or `oldest`.
 
 #### Example Requests

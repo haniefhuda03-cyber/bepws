@@ -411,7 +411,7 @@ components:
       schema:
         type: string
         format: date-time
-      description: "Filter mulai dari tanggal (ISO 8601). Contoh: 2026-02-01T00:00:00Z"
+      description: "Filter mulai dari tanggal (ISO 8601). Contoh: 2026-02-01T00:00:00Z. Wajib dikirim bersama end_date."
 
     EndDateParam:
       name: end_date
@@ -420,7 +420,7 @@ components:
       schema:
         type: string
         format: date-time
-      description: "Filter sampai tanggal (ISO 8601). Contoh: 2026-02-28T23:59:59Z"
+      description: "Filter sampai tanggal (ISO 8601). Contoh: 2026-02-28T23:59:59Z. Wajib dikirim bersama start_date."
 
     SortParam:
       name: sort

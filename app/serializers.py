@@ -821,7 +821,7 @@ def get_latest_weather_data(source: str, load_fields: Optional[List[Any]] = None
     return q.order_by(order_field.desc()).first()
 
 
-def get_graph_payload(range_param: Optional[str], month: Optional[str] = None, year: Optional[str] = None, source: Optional[str] = None, datatype: Optional[str] = None) -> Dict[str, Any]:
+def get_graph_payload(range_param: Optional[str], month: Optional[str] = None, source: Optional[str] = None, datatype: Optional[str] = None) -> Dict[str, Any]:
     """
     Get graph data (daily aggregation) from WeatherLog tables.
     
@@ -855,7 +855,7 @@ def get_graph_payload(range_param: Optional[str], month: Optional[str] = None, y
         return {"ok": False, "message": f"unknown datatype '{dt}'"}
 
     # 1. Try Cache
-    cache_key = f"weather_graph:{rp}:{src}:{dt}:{month or ''}:{year or ''}"
+    cache_key = f"weather_graph:{rp}:{src}:{dt}:{month or ''}"
     try:
         from . import cache as _cache
         cached = _cache.get(cache_key)
@@ -871,11 +871,8 @@ def get_graph_payload(range_param: Optional[str], month: Optional[str] = None, y
     # Timezone & Current Time
     now_wib = get_wib_now()
     
-    # Determine Year
-    try:
-        year_i = int(year) if year else now_wib.year
-    except ValueError:
-        return {"ok": False, "message": "year must be integer"}
+    # Year selalu menggunakan tahun server saat ini
+    year_i = now_wib.year
 
     # Determine Date Range
     if rp == 'weekly':

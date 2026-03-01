@@ -359,11 +359,7 @@ def strict_params(endpoint_name):
             
             # Validate each provided param
             for param, value in request.args.items():
-                schema = PARAM_SCHEMAS.get(param)
-                if not schema:
-                    continue
-                
-                # Check empty values
+                # Check empty values first
                 if value.strip() == '':
                     return _error(
                         "INVALID_PARAMETER",
@@ -378,6 +374,10 @@ def strict_params(endpoint_name):
                         f"Query param '{param}' cannot contain spaces",
                         400
                     )
+
+                schema = PARAM_SCHEMAS.get(param)
+                if not schema:
+                    continue
 
                 
                 # Type validation
@@ -577,13 +577,13 @@ def weather_predict():
     # Validate limit
     limit_raw = request.args.get('limit')
     limit = 12
-    if limit_raw:
+    if limit_raw is not None:
         try:
             limit = int(limit_raw)
         except ValueError:
             return _error("INVALID_PARAMETER", "Limit must be valid integer")
             
-    if model == 'xgboost' and limit_raw:
+    if model == 'xgboost' and limit_raw is not None:
          return _error("INVALID_PARAMETER", "Limit not allowed for XGBoost")
          
     # Call Serializer
@@ -805,6 +805,9 @@ def weather_history():
     end_date = request.args.get('end_date')
     sort = request.args.get('sort', 'newest')
     
+    if (start_date and not end_date) or (end_date and not start_date):
+        return _error("MISSING_PARAMETER", "start_date and end_date must be provided together")
+    
     # Use serializer
     payload = serializers.get_history_payload(
         page=page,
@@ -881,24 +884,14 @@ def weather_graph():
     if range_param.lower() == 'monthly':
         if month_raw is None:
             return _error("MISSING_PARAMETER", "Query param 'month' is required when range is 'monthly'")
-        if month_raw.strip() == '':
-            return _error("INVALID_PARAMETER", "Query param 'month' cannot be empty")
+    else:
+        if month_raw is not None:
+            return _error("INVALID_PARAMETER", "Query param 'month' is only allowed when range is 'monthly'")
             
-    # Validate year
-    year_raw = request.args.get('year')
-    if year_raw is not None:
-        if year_raw.strip() == '':
-             return _error("INVALID_PARAMETER", "Query param 'year' cannot be empty")
-        try:
-            int(year_raw)
-        except ValueError:
-            return _error("INVALID_PARAMETER", "Query param 'year' must be a valid integer")
-    
     # Use serializers for graph logic
     payload = serializers.get_graph_payload(
         range_param=range_param,
         month=month_raw,
-        year=year_raw,
         source=source,
         datatype=datatype
     )
@@ -915,8 +908,6 @@ def weather_graph():
         params_applied["source"] = source
     if month_raw:
         params_applied["month"] = int(month_raw) if month_raw else None
-    if year_raw:
-        params_applied["year"] = int(year_raw)
     
     return jsonify({
         "meta": _meta(source=source, extra={

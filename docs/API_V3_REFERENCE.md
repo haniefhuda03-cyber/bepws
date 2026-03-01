@@ -393,7 +393,6 @@ Get aggregated data for graphs. Data diagregasi **per hari WIB** (bukan UTC). Li
 | `datatype` | string | **Yes** | Type of data to graph. |
 | `source` | string | No | Data source. Default: `ecowitt`. |
 | `month` | int | **Yes** (monthly) | Bulan (1-12). Wajib jika `range=monthly`. |
-| `year` | int | No | Tahun (YYYY). Default: tahun saat ini. |
 
 **Allowed Datatypes**:
 `temperature`, `humidity`, `rainfall`, `wind_speed`, `uvi`, `solar_radiation`, `relative_pressure`.
@@ -422,7 +421,6 @@ GET /api/v3/weather/graph?range=weekly&datatype=temperature&source=ecowitt
     "source": "ecowitt",
     "range": "weekly",
     "datatype": "temperature",
-    "year": 2026,
     "month": 2
   },
   "data": [

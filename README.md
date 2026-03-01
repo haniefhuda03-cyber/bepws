@@ -202,16 +202,15 @@ Fitur:
 |-----------|----------|--------|
 | `source` | current, predict, details, history, graph | `ecowitt` \| `wunderground` (default: `ecowitt`) |
 | `model` | predict | `lstm` \| `xgboost` (default: `lstm`) |
-| `limit` | predict | `1-24` (default: `12`, LSTM only) |
+| `limit` | predict | `1-24` (default: `12`, LSTM only. **Banned for XGBoost**) |
 | `page` | history | `≥ 1` (default: `1`) |
 | `per_page` | history | `1-10` (default: `5`) |
-| `start_date` | history | ISO 8601 datetime |
-| `end_date` | history | ISO 8601 datetime |
+| `start_date` | history | ISO 8601 datetime (wajib dipasangkan dengan `end_date`) |
+| `end_date` | history | ISO 8601 datetime (wajib dipasangkan dengan `start_date`) |
 | `sort` | history | `newest` \| `oldest` (default: `newest`) |
 | `range` | graph | `weekly` \| `monthly` (**wajib**) |
 | `datatype` | graph | `temperature` \| `humidity` \| `rainfall` \| `wind_speed` \| `uvi` \| `solar_radiation` \| `relative_pressure` (**wajib**) |
-| `month` | graph | `1-12` (wajib untuk `range=monthly`) |
-| `year` | graph | `YYYY` (default: tahun ini) |
+| `month` | graph | `1-12` (wajib untuk `range=monthly`. **Banned untuk weekly**) |
 
 ### Response Format
 ```json

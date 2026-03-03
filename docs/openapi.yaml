@@ -14,6 +14,13 @@ info:
     ## Data Sources
     - **ecowitt**: Ecowitt weather station (metric units)
     - **wunderground**: Weather Underground PWS (metric units)
+    - **console**: Console station device (imperial units, konversi internal untuk ML)
+    
+    ## Timezone
+    - Semua timestamp di response dalam **UTC** (ISO 8601).
+    - Parameter `start_date`/`end_date` mendukung multi-format. Tanpa offset timezone → diasumsikan **WIB (UTC+7)**.
+    - Data grafik diagregasi per hari **WIB**.
+    - Prediksi `time_target_predict` dan `date_target_predict` dalam **WIB**.
     
     ## Caching
     Semua GET endpoint (kecuali `/health`) menggunakan cache dual-layer (Redis primary + in-memory fallback):
@@ -71,7 +78,7 @@ components:
           example: "2026-02-24T03:10:00.000000+00:00"
         source:
           type: string
-          enum: [ecowitt, wunderground]
+          enum: [ecowitt, wunderground, console]
           nullable: true
           description: Sumber data cuaca yang digunakan
 
@@ -358,9 +365,9 @@ components:
       required: false
       schema:
         type: string
-        enum: [ecowitt, wunderground]
+        enum: [ecowitt, wunderground, console]
         default: ecowitt
-      description: Sumber data cuaca. Default ecowitt.
+      description: Sumber data cuaca. Default ecowitt. Console hanya tersedia untuk history.
 
     ModelParam:
       name: model
@@ -410,8 +417,16 @@ components:
       required: false
       schema:
         type: string
-        format: date-time
-      description: "Filter mulai dari tanggal (ISO 8601). Contoh: 2026-02-01T00:00:00Z. Wajib dikirim bersama end_date."
+      description: |
+        Filter mulai dari tanggal. Mendukung multi-format:
+        - ISO 8601: `2026-02-01T00:00:00Z`, `2026-02-01T07:00:00+07:00`
+        - Date only: `2026-02-01`, `2026/02/01`
+        - DD-MM-YYYY: `01-02-2026`
+        - Compact: `20260201`
+        - Date+time: `2026-02-01 14:30:00`
+        
+        **Tanpa timezone offset → diasumsikan WIB (UTC+7).**
+        Wajib dikirim bersama end_date.
 
     EndDateParam:
       name: end_date
@@ -419,8 +434,10 @@ components:
       required: false
       schema:
         type: string
-        format: date-time
-      description: "Filter sampai tanggal (ISO 8601). Contoh: 2026-02-28T23:59:59Z. Wajib dikirim bersama start_date."
+      description: |
+        Filter sampai tanggal. Mendukung multi-format (sama seperti start_date).
+        **Tanpa timezone offset → diasumsikan WIB (UTC+7).**
+        Wajib dikirim bersama start_date.
 
     SortParam:
       name: sort
@@ -746,7 +763,7 @@ paths:
         Mengembalikan data histori cuaca dengan **pagination**.
         
         Mendukung filter berdasarkan:
-        - **start_date** / **end_date** — Rentang waktu (ISO 8601)
+        - **start_date** / **end_date** — Rentang waktu (multi-format, tanpa offset = WIB)
         - **sort** — Urutan data (newest / oldest)
         - **page** / **per_page** — Pagination
         
@@ -872,6 +889,7 @@ paths:
                       max: 31.5
                       data_count: 150
                       status: partial
+                  timezone: "WIB (UTC+7)"
               schema:
                 type: object
                 properties:
@@ -882,16 +900,16 @@ paths:
                     properties:
                       summary:
                         type: object
-                        description: Ringkasan data (avg, min, max)
+                        description: Ringkasan data (avg, min, max) dihitung dari seluruh raw data row dalam range
                       graph:
                         type: array
-                        description: Data per hari
+                        description: Data per hari (pengelompokan WIB)
                         items:
                           type: object
                           properties:
                             date:
                               type: string
-                              description: Tanggal (YYYY-MM-DD)
+                              description: Tanggal WIB (YYYY-MM-DD)
                             avg:
                               type: number
                             min:
@@ -903,6 +921,13 @@ paths:
                             status:
                               type: string
                               enum: [complete, partial, no_data, future]
+                              description: |
+                                Status hari: complete (lewat, ada data), partial (hari ini WIB),
+                                no_data (lewat, tanpa data), future (belum terjadi, y=null)
+                      timezone:
+                        type: string
+                        description: Zona waktu yang digunakan untuk pengelompokan data
+                        example: "WIB (UTC+7)"
         '401':
           description: X-APP-KEY tidak ada atau tidak valid
           content:

@@ -1,6 +1,84 @@
-# TUWS Weather API Backend
+# TUWS Weather API Backend — Manual Book
 
-Backend API untuk sistem prediksi cuaca menggunakan LSTM dan XGBoost.
+Backend API untuk sistem monitoring & prediksi cuaca **TUWS** (Telkom University Weather Station).  
+Menggunakan **LSTM** untuk prediksi intensitas hujan 24 jam ke depan dan **XGBoost** untuk klasifikasi arah hujan.
+
+---
+
+## Daftar Isi
+
+1. [Arsitektur Sistem](#-arsitektur-sistem)
+2. [Quick Start](#-quick-start-pertama-kali)
+3. [Konfigurasi Environment](#step-5-konfigurasi-environment-env)
+4. [API Endpoints](#-api-v3-endpoints)
+5. [Timezone & Waktu](#-timezone--waktu)
+6. [Pipeline Prediksi ML](#-pipeline-prediksi-ml)
+7. [Scheduler & Auto-Fetch](#-scheduler--auto-fetch)
+8. [Caching](#-caching)
+9. [Production Deployment](#-production-deployment-vps--cloud)
+10. [Database & Migrasi](#-perintah-migrasi-database)
+11. [Testing](#-menjalankan-tests)
+12. [Struktur Proyek](#-project-structure)
+13. [Environment Variables](#-environment-variables)
+
+---
+
+## 🏗 Arsitektur Sistem
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        TUWS Backend                             │
+│                                                                 │
+│  ┌──────────┐   ┌────────────┐   ┌──────────────┐              │
+│  │ Ecowitt  │   │Wunderground│   │ Console Stn  │ ← Data Source│
+│  └────┬─────┘   └─────┬──────┘   └──────┬───────┘             │
+│       │               │                 │                      │
+│       ▼               ▼                 ▼                      │
+│  ┌─────────────────────────────────────────┐                   │
+│  │       APScheduler (setiap 5 menit)      │                   │
+│  │       fetch_and_store_weather()         │                   │
+│  └─────────────────┬───────────────────────┘                   │
+│                    │                                            │
+│       ┌────────────┼────────────┐                              │
+│       ▼            ▼            ▼                              │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐                          │
+│  │ XGBoost │ │ XGBoost │ │ XGBoost │ ← Klasifikasi Arah      │
+│  │   +     │ │   +     │ │   +     │    Hujan (9 kelas)       │
+│  │  LSTM   │ │  LSTM   │ │  LSTM   │ ← Prediksi Intensitas   │
+│  │ecowitt  │ │console  │ │wunder.  │    Hujan 24 jam          │
+│  └────┬────┘ └────┬────┘ └────┬────┘                          │
+│       │           │           │   ← 3 thread parallel         │
+│       └───────────┼───────────┘                                │
+│                   ▼                                            │
+│  ┌────────────────────────────────┐                            │
+│  │       PostgreSQL Database      │                            │
+│  │  weather_log_* + prediction_*  │                            │
+│  └────────────────┬───────────────┘                            │
+│                   │                                            │
+│  ┌────────────────┼───────────────┐                            │
+│  │          Redis Cache           │                            │
+│  │  (fallback: in-memory dict)    │                            │
+│  └────────────────┬───────────────┘                            │
+│                   │                                            │
+│                   ▼                                            │
+│  ┌────────────────────────────────┐                            │
+│  │      Flask REST API v3        │                             │
+│  │    /api/v3/weather/*          │                             │
+│  └────────────────────────────────┘                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Komponen Utama:**
+
+| Komponen | Teknologi | Fungsi |
+|----------|-----------|--------|
+| Web Framework | Flask + Gunicorn | REST API |
+| Database | PostgreSQL 15 | Penyimpanan data cuaca & prediksi |
+| Cache | Redis (+ in-memory fallback) | Response caching |
+| Scheduler | APScheduler | Auto-fetch data tiap 5 menit |
+| ML Classification | XGBoost | Prediksi arah hujan (9 kelas) |
+| ML Regression | LSTM (TensorFlow/Keras) | Prediksi intensitas hujan 24 jam |
+| Scaler | MinMaxScaler (sklearn) | Normalisasi fitur LSTM |
 
 ---
 
@@ -81,7 +159,7 @@ FLASK_PORT=5000
 SECRET_KEY="your-random-secret-key-here"
 
 # API Key untuk akses endpoint v3 (header X-APP-KEY)
-API_READ_KEY="tuws2526"
+APPKEY="your-api-key-here"
 
 # ============================================================
 # WEATHER API KEYS
@@ -161,7 +239,7 @@ INFO - Swagger UI available at: /api/docs
 curl http://127.0.0.1:5000/api/v3/health
 
 # Cuaca terkini (dengan API key)
-curl -H "X-APP-KEY: tuws2526" http://127.0.0.1:5000/api/v3/weather/current
+curl -H "X-APP-KEY: your-key" http://127.0.0.1:5000/api/v3/weather/current
 ```
 
 ---
@@ -205,8 +283,8 @@ Fitur:
 | `limit` | predict | `1-24` (default: `12`, LSTM only. **Banned for XGBoost**) |
 | `page` | history | `≥ 1` (default: `1`) |
 | `per_page` | history | `1-10` (default: `5`) |
-| `start_date` | history | ISO 8601 datetime (wajib dipasangkan dengan `end_date`) |
-| `end_date` | history | ISO 8601 datetime (wajib dipasangkan dengan `start_date`) |
+| `start_date` | history | Multi-format datetime — lihat [Format Tanggal](#format-tanggal-yang-didukung) |
+| `end_date` | history | Multi-format datetime — lihat [Format Tanggal](#format-tanggal-yang-didukung) |
 | `sort` | history | `newest` \| `oldest` (default: `newest`) |
 | `range` | graph | `weekly` \| `monthly` (**wajib**) |
 | `datatype` | graph | `temperature` \| `humidity` \| `rainfall` \| `wind_speed` \| `uvi` \| `solar_radiation` \| `relative_pressure` (**wajib**) |
@@ -240,24 +318,197 @@ Fitur:
 }
 ```
 
-📄 **Dokumentasi lengkap**: lihat [`docs/API_V3_REFERENCE.md`](docs/API_V3_REFERENCE.md)
+### Format Tanggal yang Didukung
+
+Parameter `start_date` dan `end_date` pada endpoint History menerima berbagai format:
+
+| Format | Contoh | Timezone |
+|--------|--------|----------|
+| ISO 8601 + Z | `2026-02-01T00:00:00Z` | UTC eksplisit |
+| ISO 8601 + offset | `2026-02-01T07:00:00+07:00` | WIB eksplisit |
+| Date only (YYYY-MM-DD) | `2026-02-01` | **WIB diasumsikan** |
+| Date slash (YYYY/MM/DD) | `2026/02/01` | **WIB diasumsikan** |
+| DD-MM-YYYY | `01-02-2026` | **WIB diasumsikan** |
+| DD/MM/YYYY | `01/02/2026` | **WIB diasumsikan** |
+| Compact (YYYYMMDD) | `20260201` | **WIB diasumsikan** |
+| Date + time | `2026-02-01 14:30:00` | **WIB diasumsikan** |
+| Date + short time | `2026-02-01 14:30` | **WIB diasumsikan** |
+
+> **Catatan:** Jika tanpa timezone info, server mengasumsikan input dalam **WIB (UTC+7)** karena konteks API ini untuk Indonesia.  
+> Contoh: `2026-02-01` diparsing sebagai `2026-02-01 00:00:00 WIB` = `2026-01-31 17:00:00 UTC`.
+
+📄 **Dokumentasi API lengkap**: lihat [`docs/API_V3_REFERENCE.md`](docs/API_V3_REFERENCE.md)
 
 ---
 
 ## ⏰ Timezone & Waktu
 
-| Aspek | Format |
-|-------|--------|
-| Database | UTC |
-| API response `timestamp` | UTC ISO 8601 (`+00:00`) |
-| Predict `time_target_predict` | **WIB** (UTC+7) |
-| Graph grouping | Per hari **WIB** |
-| History filter (`start_date`/`end_date`) | Menghormati offset yang dikirim client. Tanpa offset = dianggap UTC |
+| Aspek | Format | Keterangan |
+|-------|--------|------------|
+| Database | **UTC** | Semua `created_at` dan `date_utc` disimpan UTC |
+| Meta `timestamp` | **UTC** | `2026-03-02T03:10:00+00:00` |
+| Data row `timestamp` | **UTC** | Endpoint history, current, details |
+| Predict `time_target_predict` | **WIB** | `"11:00"` = jam 11 pagi WIB |
+| Predict `date_target_predict` | **WIB** | `"02-03-26"` = 2 Maret 2026 WIB |
+| Graph `date` per hari | **WIB** | Pengelompokan per hari kalender WIB |
+| Graph `status` | **WIB** | `today` ditentukan dari jam WIB saat ini |
+| History filter input | **WIB** (default) | Jika tidak ada offset, dianggap WIB |
 
-**Contoh filter history berdasarkan WIB:**
-```http
-GET /api/v3/weather/history?start_date=2026-02-01T00:00:00+07:00&end_date=2026-02-01T23:59:59+07:00
+### Mengapa Penting?
+
+Data jam 01:00 WIB = 18:00 UTC **hari sebelumnya**. Jika dikategorikan berdasarkan UTC, data tersebut masuk ke hari yang salah. Oleh karena itu:
+
+- **Graph API**: Pengelompokan harian menggunakan WIB  
+  ```sql
+  GROUP BY date(timezone('Asia/Jakarta', timezone('UTC', created_at)))
+  ```
+- **History filter**: Input tanpa timezone diasumsikan WIB  
+  `2026-03-01` → `2026-03-01 00:00 WIB` → `2026-02-28 17:00 UTC`
+
+### Contoh Filter History
+
+| Tujuan | Request | Penjelasan |
+|--------|---------|------------|
+| Data 1 Maret WIB penuh | `start_date=2026-03-01&end_date=2026-03-01T23:59:59+07:00` | 00:00–23:59 WIB |
+| Data 1 Maret UTC penuh | `start_date=2026-03-01T00:00:00Z&end_date=2026-03-01T23:59:59Z` | 00:00–23:59 UTC |
+| Tanpa offset (WIB default) | `start_date=01-03-2026&end_date=31-03-2026` | DD-MM-YYYY, diasumsikan WIB |
+
+---
+
+## 🤖 Pipeline Prediksi ML
+
+### Ringkasan Model
+
+| Model | Tipe | Input | Output |
+|-------|------|-------|--------|
+| **XGBoost** | Klasifikasi | 6 fitur cuaca terkini (1 row) | 1 label arah hujan (kelas 0–8) |
+| **LSTM** | Regresi | 9 fitur × 144 timestep (12 jam) | 24 nilai intensitas hujan (mm/h per jam) |
+
+### Alur LSTM End-to-End
+
 ```
+DB (154 rows terbaru)
+  │
+  ▼
+Parse + Konversi Unit (Console: Imperial→Metric)
+  │
+  ▼
+Normalisasi Timestamp (floor ke kelipatan 5 menit)
+  │
+  ├── Tidak ada gap → langsung ke tail(144)
+  │
+  ▼
+Resample + Interpolasi Linear
+  │  - Grid 5 menit tepat
+  │  - Interpolasi maks 6 slot (30 menit gap)
+  │  - Duplikat: di-merge rata-rata
+  │
+  ├── Rasio interpolasi ≥ 25% → ABORT (data terlalu banyak bolong)
+  │
+  ▼
+tail(144) → 12 jam data terbaru
+  │
+  ▼
+Imputasi NaN: ffill → bfill → default klimatologis Indonesia
+  │  suhu=27°C, kelembaban=75%, tekanan=1010 hPa, dll.
+  │
+  ▼
+Tambah fitur waktu: hour_sin, hour_cos (cyclical, WIB)
+  │
+  ▼
+MinMaxScaler.transform() → (144, 9)
+  │
+  ▼
+Reshape → (1, 144, 9) → LSTM.predict()
+  │
+  ▼
+Output → (1, 24) scaled values
+  │
+  ▼
+Inverse Scale (fitur hujan index=5)
+  │
+  ▼
+Clamp ≥ 0 → Round 2dp → [24 × mm/h]
+```
+
+### XGBoost Labels
+
+| Kelas | Label |
+|-------|-------|
+| 0 | Cerah / Berawan |
+| 1 | Berpotensi Hujan dari Arah Utara |
+| 2 | Berpotensi Hujan dari Arah Timur Laut |
+| 3 | Berpotensi Hujan dari Arah Timur |
+| 4 | Berpotensi Hujan dari Arah Tenggara |
+| 5 | Berpotensi Hujan dari Arah Selatan |
+| 6 | Berpotensi Hujan dari Arah Barat Daya |
+| 7 | Berpotensi Hujan dari Arah Barat |
+| 8 | Berpotensi Hujan dari Arah Barat Laut |
+
+### Konstanta Model
+
+| Konstanta | Nilai | Keterangan |
+|-----------|-------|------------|
+| `SEQUENCE_LENGTH` | 144 | 144 × 5 menit = 12 jam |
+| `PREDICTION_STEPS` | 24 | Output 24 jam ke depan |
+| `N_FEATURES` | 9 | 7 cuaca + hour_sin + hour_cos |
+| `RAIN_FEATURE_INDEX` | 5 | Index kolom intensitas_hujan pada scaler |
+| `MAX_INTERPOLATED_RATIO` | 0.25 | Maks 25% data boleh hasil interpolasi |
+| `buffer_size` | 154 | 144 + 10 (buffer untuk gap ringan) |
+| Interpolasi limit | 6 slot | Maks 30 menit gap yang diinterpolasi |
+
+---
+
+## ⏰ Scheduler & Auto-Fetch
+
+### Job yang Terdaftar
+
+| Job | Jadwal | Fungsi |
+|-----|--------|--------|
+| `fetch-weather` | Setiap 5 menit | Fetch data dari Ecowitt, Wunderground, Console |
+| `hourly-prediction-safety` | Menit ke-8 setiap jam | Safety net prediksi jika trigger utama gagal |
+
+### Alur Fetch → Predict
+
+```
+APScheduler (menit :00, :05, :10, ...)
+  │
+  ▼
+fetch_and_store_weather()
+  ├── Parallel: Ecowitt + Wunderground (timeout 30s, retry 3×)
+  ├── Sequential: Console
+  │
+  ├── IF fetch selesai di menit < 5 WIB:
+  │     └── run_prediction_pipeline()    ← PRIMARY trigger
+  │
+  └── Safety net di menit :08:
+        └── IF belum prediksi jam ini:
+              └── run_prediction_pipeline()  ← BACKUP trigger
+```
+
+### Dedup Guard
+
+Variabel `_last_prediction_hour` mencegah prediksi ganda dalam 1 jam yang sama.
+
+---
+
+## 💾 Caching
+
+Cache dual-layer: **Redis** (primary) + **in-memory dict** (fallback otomatis jika Redis mati).
+
+| Endpoint | Cache Key Pattern | TTL |
+|----------|-------------------|-----|
+| `/weather/current` | `weather_current:{source}` | 60s |
+| `/weather/predict` | `weather_predict:{source}:{limit}` | 300s |
+| `/weather/details` | `weather_details:{source}` | 60s |
+| `/weather/history` | `weather_history:{src}:{pg}:{pp}:{sd}:{ed}:{sort}` | 120s |
+| `/weather/graph` | `weather_graph:{rng}:{src}:{dt}:{mo}` | 300s |
+| `/health` | Tidak di-cache | — |
+| `/weather/console` | Tidak di-cache | — |
+
+- Cache **HIT** → database TIDAK diquery
+- Cache **MISS** → query DB → simpan ke cache
+- Redis **mati** → otomatis fallback ke in-memory (tanpa error)
 
 ---
 
@@ -339,11 +590,12 @@ tuwsbe-fix/
 │   │   └── helpers.py           # Konversi unit, timezone, utilities
 │   └── services/
 │       └── prediction_service.py  # ML prediction pipeline
-├── ml_models/                   # Trained ML models (.pkl, .h5)
+├── ml_models/                   # Trained ML models (.keras, .joblib)
 ├── migrations/                  # Database migrations
 ├── tests/                       # Test suites
 ├── docs/
 │   ├── API_V3_REFERENCE.md      # Dokumentasi API lengkap
+│   ├── DATA_REFERENCE.md        # Referensi data
 │   └── openapi.yaml             # OpenAPI 3.0.3 specification
 ├── run.py                       # Entry point
 ├── requirements.txt
@@ -358,7 +610,7 @@ tuwsbe-fix/
 |----------|-----------|---------|
 | `DATABASE_URL` | PostgreSQL connection string | *(wajib)* |
 | `SECRET_KEY` | Flask secret key | Auto-generate ke `instance/` |
-| `API_READ_KEY` | API key untuk header `X-APP-KEY` | *(tanpa auth jika kosong)* |
+| `APPKEY` | API key untuk header `X-APP-KEY` | *(tanpa auth jika kosong)* |
 | `FLASK_HOST` | Host binding | `127.0.0.1` |
 | `FLASK_PORT` | Port | `5000` |
 | `FLASK_DEBUG` | Debug mode | `0` |
@@ -373,3 +625,46 @@ tuwsbe-fix/
 | `ECO_API_KEY` | Ecowitt API key | *(opsional)* |
 | `ECO_MAC` | Ecowitt device MAC | *(opsional)* |
 | `WUNDERGROUND_URL` | Wunderground API URL | *(opsional)* |
+
+---
+
+## 📊 Tabel Database Utama
+
+| Tabel | Fungsi |
+|-------|--------|
+| `weather_log_ecowitt` | Data cuaca dari Ecowitt |
+| `weather_log_wunderground` | Data cuaca dari Wunderground |
+| `weather_log_console` | Data cuaca dari Console Station |
+| `prediction_log` | Log prediksi (referensi ke model, data, result) |
+| `data_xgboost` | Referensi 1 weather_log ID per source untuk XGBoost |
+| `data_lstm` | Referensi 144 weather_log IDs per source untuk LSTM |
+| `xgboost_prediction_result` | Hasil prediksi XGBoost (label_id per source) |
+| `lstm_prediction_result` | Hasil prediksi LSTM (array 24 float per source) |
+| `label` | Label arah hujan (9 kelas) |
+| `model` | Metadata model ML |
+
+---
+
+## 📐 Konversi Unit
+
+Konversi unit **hanya terjadi di pipeline prediksi internal**, bukan di response API.
+
+| Konversi | Fungsi | Contoh |
+|----------|--------|--------|
+| °F → °C | `fahrenheit_to_celsius()` | 100°F → 37.78°C |
+| inHg → hPa | `inch_hg_to_hpa()` | 29.92 → 1013.21 |
+| mph → m/s | `mph_to_ms()` | 10 → 4.47 |
+| in/hr → mm/hr | `inch_per_hour_to_mm_per_hour()` | 0.33 → 8.38 |
+| W/m² → lux | `wm2_to_lux()` | 100 → 12670 |
+
+### Satuan Data per Source di Database
+
+| Parameter | Ecowitt | Wunderground | Console |
+|-----------|---------|--------------|---------|
+| Temperature | °C | °C | °F |
+| Pressure | hPa | hPa | inHg |
+| Wind Speed | m/s | m/s | mph |
+| Rain | mm/hr | mm/hr | in/hr |
+| Solar | lux | W/m² | W/m² |
+
+> Response API mengembalikan data **apa adanya** dari database tanpa konversi. Hanya pipeline prediksi yang melakukan konversi internal.

@@ -79,22 +79,48 @@ Semua field `timestamp` di response menggunakan format **UTC ISO 8601**:
 
 ### Filter Pencarian (`start_date` / `end_date`)
 
-Server menggunakan `datetime.fromisoformat()` untuk parsing — artinya **server menghormati timezone yang Anda kirim**:
+Server mendukung **multi-format datetime** melalui `parse_flexible_date()`. Format berikut diterima:
+
+| Format | Contoh | Timezone |
+|--------|--------|----------|
+| ISO 8601 + Z | `2026-02-01T00:00:00Z` | UTC eksplisit |
+| ISO 8601 + offset | `2026-02-01T07:00:00+07:00` | WIB eksplisit |
+| Date only (YYYY-MM-DD) | `2026-02-01` | **WIB diasumsikan** |
+| Date slash (YYYY/MM/DD) | `2026/02/01` | **WIB diasumsikan** |
+| DD-MM-YYYY | `01-02-2026` | **WIB diasumsikan** |
+| DD/MM/YYYY | `01/02/2026` | **WIB diasumsikan** |
+| Compact (YYYYMMDD) | `20260201` | **WIB diasumsikan** |
+| Date + time | `2026-02-01 14:30:00` | **WIB diasumsikan** |
+| Date + short time | `2026-02-01 14:30` | **WIB diasumsikan** |
 
 | Input Client | Diparsing Sebagai | Keterangan |
 |---|---|---|
 | `2026-02-01T00:00:00Z` | UTC 00:00 | `Z` = UTC |
 | `2026-02-01T00:00:00+07:00` | WIB 00:00 = UTC 17:00 sebelumnya | Offset WIB dihormati |
-| `2026-02-01T00:00:00` | UTC 00:00 (naive) | Tanpa offset → dianggap UTC |
+| `2026-02-01` | WIB 00:00 = UTC 17:00 sebelumnya | **Tanpa offset → dianggap WIB** |
+| `01-02-2026` | WIB 00:00 = UTC 17:00 sebelumnya | Format DD-MM-YYYY, dianggap WIB |
+| `20260201` | WIB 00:00 = UTC 17:00 sebelumnya | Compact, dianggap WIB |
 
 > [!IMPORTANT]
-> Jika Anda ingin memfilter berdasarkan **waktu WIB**, selalu sertakan offset `+07:00`. Jika tidak ada offset, server menganggap input sebagai UTC.
+> **Jika tidak ada timezone offset, input dianggap WIB (UTC+7)** karena konteks API ini untuk Indonesia.  
+> Jika Anda ingin filter berdasarkan UTC, gunakan suffix `Z` atau `+00:00`.  
+> Contoh: `2026-02-01` diparsing sebagai `2026-02-01 00:00:00 WIB` = `2026-01-31 17:00:00 UTC`.
 
 #### Contoh Penggunaan Filter
 
 **Mencari data tanggal 1 Feb 2026 (WIB penuh, 00:00-23:59 WIB):**
 ```http
 GET /api/v3/weather/history?start_date=2026-02-01T00:00:00+07:00&end_date=2026-02-01T23:59:59+07:00
+```
+
+**Sama saja — tanpa offset, dianggap WIB:**
+```http
+GET /api/v3/weather/history?start_date=2026-02-01&end_date=2026-02-01T23:59:59
+```
+
+**Pakai DD-MM-YYYY:**
+```http
+GET /api/v3/weather/history?start_date=01-02-2026&end_date=28-02-2026
 ```
 
 **Mencari data tanggal 1 Feb 2026 (UTC penuh):**
@@ -307,18 +333,19 @@ Get paginated historical weather data with filtering and sorting by `created_at`
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `source` | string | No | Data source (`ecowitt` or `wunderground`). Default: `ecowitt`. |
+| `source` | string | No | Data source (`ecowitt`, `wunderground`, or `console`). Default: `ecowitt`. |
 | `page` | int | No | Page number (min 1). Default: 1. |
 | `per_page` | int | No | Items per page (1-10). Default: 5. |
-| `start_date` | ISO 8601 | No | Filter mulai dari datetime ini. Gunakan offset timezone untuk presisi (lihat [Timezone Guide](#timezone--datetime-guide)). |
-| `end_date` | ISO 8601 | No | Filter sampai datetime ini. |
+| `start_date` | datetime | No | Filter mulai dari datetime ini. Mendukung multi-format (lihat [Timezone Guide](#filter-pencarian-start_date--end_date)). |
+| `end_date` | datetime | No | Filter sampai datetime ini. Mendukung multi-format. |
 | `sort` | string | No | Sort order: `newest` (DESC) or `oldest` (ASC). Default: `newest`. |
 
 > [!IMPORTANT]
-> **Timezone pada filter:** Jika Anda mengirim `start_date=2026-02-01T00:00:00Z` (UTC), itu setara dengan `2026-02-01T07:00:00+07:00` (WIB). Untuk mencari berdasarkan hari WIB, selalu gunakan offset `+07:00`. Lihat [Timezone Guide](#timezone--datetime-guide) untuk contoh lengkap.
+> **Timezone pada filter:** Jika tanpa offset timezone, input dianggap **WIB (UTC+7)**. Gunakan suffix `Z` atau `+00:00` untuk UTC eksplisit.  
+> Lihat [Timezone Guide](#filter-pencarian-start_date--end_date) untuk contoh lengkap.
 
 > **Validation Rules:**
-> - `start_date` and `end_date` must be valid ISO 8601 datetime strings.
+> - `start_date` and `end_date` harus valid sesuai format yang didukung (lihat tabel format di Timezone Guide).
 > - `start_date` and `end_date` **MUST be provided together**. You cannot use only one of them.
 > - `start_date` must be earlier than or equal to `end_date`.
 > - `sort` only accepts `newest` or `oldest`.
@@ -432,7 +459,8 @@ GET /api/v3/weather/graph?range=weekly&datatype=temperature&source=ecowitt
     "avg": 28.15,
     "min": 25.1,
     "max": 31.5
-  }
+  },
+  "timezone": "WIB (UTC+7)"
 }
 ```
 
@@ -440,9 +468,22 @@ GET /api/v3/weather/graph?range=weekly&datatype=temperature&source=ecowitt
 | Status | Keterangan |
 |---|---|
 | `complete` | Hari sudah lewat, ada data |
-| `partial` | Hari ini, data masih berjalan |
+| `partial` | Hari ini (WIB), data masih berjalan |
 | `no_data` | Hari sudah lewat, tidak ada data |
 | `future` | Hari belum terjadi, `y` selalu `null` |
+
+#### Summary Calculation
+
+Field `summary` dihitung dari **seluruh raw data row** (bukan dari nilai harian yang sudah diagregasi):
+- `avg`: Rata-rata dari semua data row dalam range
+- `min`: Nilai minimum dari semua data row
+- `max`: Nilai maximum dari semua data row
+- Row dengan nilai `NULL` di-**exclude** dari perhitungan
+
+> **Catatan:** Summary dihitung berdasarkan rentang WIB. Untuk `range=weekly`, dihitung dari Senin 00:00 WIB s.d. Minggu 23:59 WIB minggu ini. Untuk `range=monthly`, dihitung dari tanggal 1 s.d. akhir bulan yang diminta dalam WIB.
+
+#### Response `timezone` Field
+Response graph menyertakan field `"timezone": "WIB (UTC+7)"` untuk menginformasikan bahwa semua pengelompokan tanggal dan status menggunakan zona waktu WIB.
 
 ---
 

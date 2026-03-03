@@ -56,6 +56,20 @@ N_FEATURES = 9              # Jumlah fitur sesuai scaler
 RAIN_FEATURE_INDEX = 5      # Index kolom 'intensitas_hujan' pada scaler
 DATA_INTERVAL_MINUTES = 5   # Interval waktu antar data point
 MAX_INTERPOLATED_RATIO = 0.25  # Maks 25% data boleh hasil interpolasi
+XGBOOST_FRESHNESS_SECONDS = 5 * 60  # 5 menit — data XGBoost harus segar (maks 2 siklus fetch)
+
+# Default values klimatologis Indonesia tropis untuk fallback fillna.
+# Digunakan HANYA jika ffill+bfill gagal (seluruh kolom NaN).
+# Nilai 0 pada suhu/tekanan akan menghasilkan outlier ekstrem pada scaler.
+_SAFE_FILL_DEFAULTS = {
+    'suhu': 27.0,              # ~rata-rata suhu Indonesia tropis (°C)
+    'kelembaban': 75.0,        # ~rata-rata kelembaban relatif (%)
+    'kecepatan_angin': 0.0,    # angin tenang, aman
+    'arah_angin': 0.0,         # utara, acceptable default
+    'tekanan_udara': 1010.0,   # ~rata-rata tekanan permukaan laut (hPa)
+    'intensitas_hujan': 0.0,   # tidak hujan, aman
+    'intensitas_cahaya': 0.0,  # gelap/malam, aman
+}
 
 # Thread safety: Lock untuk LSTM predict() — TF tidak menjamin thread-safety secara resmi
 _lstm_predict_lock = threading.Lock()
@@ -335,59 +349,6 @@ def _check_data_needs_interpolation(timestamps: List[datetime]) -> bool:
     return False
 
 
-def _resample_and_interpolate(df: pd.DataFrame, timestamp_col: str = 'timestamp') -> pd.DataFrame:
-    """
-    Resample data ke interval 5 menit tepat dan interpolasi nilai yang hilang.
-    
-    Proses:
-    1. Normalisasi timestamp ke kelipatan 5 menit (floor, abaikan detik)
-    2. Hapus duplikat (ambil rata-rata jika ada duplikat)
-    3. Resample ke grid 5 menit yang tepat
-    4. Interpolasi linear untuk mengisi gap
-    
-    Contoh grid: 00:00, 00:05, 00:10, 00:15, ..., 23:55
-    """
-    if df.empty:
-        return df
-    
-    df = df.copy()
-    df[timestamp_col] = pd.to_datetime(df[timestamp_col])
-    
-    # Step 1: Normalisasi timestamp ke kelipatan 5 menit
-    df[timestamp_col] = df[timestamp_col].apply(_normalize_timestamp_to_5min)
-    
-    # Step 2: Hapus duplikat dengan mengambil rata-rata
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    df = df.groupby(timestamp_col)[numeric_cols].mean().reset_index()
-    
-    # Step 3: Set timestamp sebagai index
-    df = df.set_index(timestamp_col)
-    
-    # Step 4: Tentukan range waktu
-    start_time = df.index.min()
-    end_time = df.index.max()
-    
-    # Step 5: Buat grid 5 menit yang tepat
-    full_range = pd.date_range(start=start_time, end=end_time, freq='5min')
-    
-    # Step 6: Reindex ke grid yang tepat
-    df = df.reindex(full_range)
-    
-    # Step 7: Interpolasi linear untuk mengisi NaN (maks 6 slot = 30 menit gap)
-    df = df.interpolate(method='linear', limit_direction='both', limit=6)
-    
-    # Step 8: Forward fill dan backward fill untuk sisa NaN di ujung
-    df = df.ffill().bfill()
-    
-    # Reset index
-    df = df.reset_index()
-    df = df.rename(columns={'index': timestamp_col})
-    
-    logging.info(f"Resample selesai: {len(df)} data points, range {start_time} - {end_time}")
-    
-    return df
-
-
 # =====================================================================
 # DATA FETCHING FUNCTIONS
 # =====================================================================
@@ -399,6 +360,7 @@ def _get_latest_weather_data(source: str) -> Optional[Any]:
         if source == 'ecowitt':
             load_fields = [
                 WeatherLogEcowitt.id,
+                WeatherLogEcowitt.request_time,
                 WeatherLogEcowitt.temperature_main_outdoor,
                 WeatherLogEcowitt.humidity_outdoor,
                 WeatherLogEcowitt.wind_speed,
@@ -409,6 +371,7 @@ def _get_latest_weather_data(source: str) -> Optional[Any]:
         elif source == 'console':
             load_fields = [
                 WeatherLogConsole.id,
+                WeatherLogConsole.date_utc,
                 WeatherLogConsole.temperature,
                 WeatherLogConsole.humidity,
                 WeatherLogConsole.wind_speed,
@@ -419,6 +382,7 @@ def _get_latest_weather_data(source: str) -> Optional[Any]:
         else:
             load_fields = [
                 WeatherLogWunderground.id,
+                WeatherLogWunderground.request_time,
                 WeatherLogWunderground.temperature,
                 WeatherLogWunderground.humidity,
                 WeatherLogWunderground.wind_speed,
@@ -508,16 +472,28 @@ def _prepare_xgboost_features(weather_log, source: str) -> Optional[Dict[str, fl
 
 def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
     """
-    Ambil 144 data point terakhir (12 jam) untuk LSTM.
+    Ambil 144 data terakhir dengan interval 5 menit untuk LSTM.
+    
+    Strategi: Data Asli ≥ 144 + Interpolasi Ringan
+    ───────────────────────────────────────────────
+    LSTM hanya jalan jika ada ≥ 144 data ASLI dari DB (setelah dedup).
+    Interpolasi hanya merapikan gap kecil (misal loncat 10 menit)
+    dalam 144 data tersebut — BUKAN mengisi kekosongan karena
+    server mati. Ini menjamin kualitas data yang masuk ke model.
     
     Proses:
-    1. Query data dari database (dengan buffer)
-    2. Normalisasi timestamp ke kelipatan 5 menit (abaikan detik)
-    3. Cek apakah ada gap yang perlu interpolasi
-    4. Resample dan interpolasi jika diperlukan
-    5. Ambil 144 data terakhir
-    6. Hitung time features (hour_sin, hour_cos)
-    7. Return (DataFrame dengan 9 kolom, List[ID] dari database)
+    1. Query data dari database (154 rows buffer)
+    2. Normalisasi timestamp ke kelipatan 5 menit
+    3. Deduplikasi (rata-rata untuk timestamp kembar)
+    4. Cek: data unik ≥ 144? Jika tidak → ABORT
+    5. Ambil 144 data terbaru
+    6. Jika interval sudah rapi (semua 5 menit) → pakai langsung
+    7. Jika ada gap (loncat 10, 15 menit dst):
+       - Buat grid 5-menit dari min→max timestamp
+       - Interpolasi ringan (maks 6 slot berturut-turut = 30 menit)
+       - Ambil tail(144), cek rasio interpolasi ≤ 25%
+    8. Hitung time features (hour_sin, hour_cos)
+    9. Return (DataFrame 144×9, list DB IDs)
     
     Berlaku sama untuk console, ecowitt, dan wunderground.
     
@@ -589,8 +565,18 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         # Reverse agar urut dari lama ke baru
         rows = list(reversed(rows))
         
-        # Simpan ID untuk referensi
+        # Build mapping: normalized_timestamp → DB ID.
+        # Digunakan setelah grid mapping untuk tracking ID yang akurat.
+        # Slot interpolasi tidak punya DB ID, hanya slot dengan data asli.
         row_ids = [row.id for row in rows]
+        _ts_to_id: Dict[str, int] = {}  # isoformat string → DB row ID
+        for row in rows:
+            _ts_raw = row.date_utc if source == 'console' else row.request_time
+            if _ts_raw is not None:
+                if _ts_raw.tzinfo is None:
+                    _ts_raw = _ts_raw.replace(tzinfo=timezone.utc)
+                _ts_norm = _normalize_timestamp_to_5min(_ts_raw)
+                _ts_to_id[_ts_norm.isoformat()] = row.id  # last write wins
         
         # Konversi ke DataFrame
         data_list = []
@@ -664,46 +650,122 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         
         logging.info(f"[{source}] Data awal: {len(df)} rows, range: {df['timestamp'].min()} - {df['timestamp'].max()}")
         
-        # Ambil timestamps untuk cek interpolasi (sudah dinormalisasi)
-        timestamps = df['timestamp'].tolist()
-        needs_interpolation = _check_data_needs_interpolation(timestamps)
+        # ── STEP 1: Deduplikasi timestamp kembar (setelah floor 5 menit) ──
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        df_deduped = df.groupby('timestamp')[numeric_cols].mean().reset_index()
+        df_deduped = df_deduped.sort_values('timestamp').reset_index(drop=True)
         
-        if needs_interpolation:
-            logging.info(f"[{source}] Data memerlukan interpolasi (ada gap atau duplikat)")
-            original_count = len(df)
-            df = _resample_and_interpolate(df, 'timestamp')
-            post_resample_count = len(df)
-            interpolated_count = max(0, post_resample_count - original_count)
+        dup_count = len(df) - len(df_deduped)
+        if dup_count > 0:
+            logging.info(
+                f"[{source}] {dup_count} duplikat digabung → "
+                f"{len(df_deduped)} timestamp unik"
+            )
+        
+        # ── STEP 2: Cek jumlah data asli ≥ 144 ──
+        # LSTM hanya jalan jika ada cukup data ASLI dari DB.
+        # Tidak ada "mengisi kekosongan" — data harus benar-benar ada.
+        if len(df_deduped) < SEQUENCE_LENGTH:
+            logging.warning(
+                f"[{source}] Data asli tidak cukup untuk LSTM: "
+                f"{len(df_deduped)}/{SEQUENCE_LENGTH} (butuh ≥{SEQUENCE_LENGTH} data unik). "
+                f"Tunggu data terkumpul."
+            )
+            return None
+        
+        # ── STEP 3: Ambil 144 data terbaru ──
+        df_144 = df_deduped.tail(SEQUENCE_LENGTH).reset_index(drop=True)
+        
+        logging.info(
+            f"[{source}] {len(df_deduped)} data unik tersedia, "
+            f"ambil {SEQUENCE_LENGTH} terbaru: "
+            f"{df_144['timestamp'].min()} → {df_144['timestamp'].max()}"
+        )
+        
+        # ── STEP 4: Cek apakah interval sudah rapi (semua 5 menit) ──
+        timestamps_144 = df_144['timestamp'].tolist()
+        needs_resample = _check_data_needs_interpolation(timestamps_144)
+        
+        if needs_resample:
+            # Ada gap (loncat 10, 15, ... menit) — perlu resample + interpolasi
+            # Bangun grid 5-menit dari min→max, interpolasi gap ringan.
+            logging.info(
+                f"[{source}] Ada gap dalam {SEQUENCE_LENGTH} data "
+                f"→ resample + interpolasi ringan"
+            )
+            
+            # Simpan set timestamp asli untuk tracking rasio interpolasi
+            original_ts_set = set(df_144['timestamp'].apply(lambda x: x.isoformat()))
+            
+            # Buat grid 5-menit dari min→max timestamp
+            ts_min = df_144['timestamp'].min()
+            ts_max = df_144['timestamp'].max()
+            grid = pd.date_range(start=ts_min, end=ts_max, freq=f'{DATA_INTERVAL_MINUTES}min')
+            
+            # Map data ke grid
+            df_grid = df_144.set_index('timestamp')
+            df_grid = df_grid.reindex(grid)
+            
+            # Interpolasi linear (maks 6 slot berturut-turut = 30 menit gap)
+            df_grid = df_grid.interpolate(method='linear', limit_direction='both', limit=6)
+            df_grid = df_grid.ffill().bfill()
+            
+            # Cek sisa NaN (gap > 30 menit tidak bisa diinterpolasi)
+            still_missing = int(df_grid.isna().any(axis=1).sum())
+            if still_missing > 0:
+                logging.warning(
+                    f"[{source}] {still_missing} slot masih kosong setelah interpolasi "
+                    f"(ada gap > 30 menit). LSTM dibatalkan."
+                )
+                return None
+            
+            # Reset index
+            df_grid = df_grid.reset_index()
+            df_grid = df_grid.rename(columns={'index': 'timestamp'})
+            
+            # Ambil tail(144) jika grid > 144 (grid bisa lebih besar karena gap)
+            if len(df_grid) > SEQUENCE_LENGTH:
+                df_grid = df_grid.tail(SEQUENCE_LENGTH).reset_index(drop=True)
+            
+            # Hitung rasio interpolasi pada window final
+            final_ts_set = set(df_grid['timestamp'].apply(lambda x: x.isoformat()))
+            interpolated_count = len(final_ts_set - original_ts_set)
             
             if interpolated_count > 0:
-                ratio = interpolated_count / post_resample_count
-                if ratio > MAX_INTERPOLATED_RATIO:
+                ratio = interpolated_count / SEQUENCE_LENGTH
+                if ratio >= MAX_INTERPOLATED_RATIO:
                     logging.warning(
                         f"[{source}] Rasio interpolasi terlalu tinggi: "
-                        f"{interpolated_count}/{post_resample_count} ({ratio:.0%}). "
-                        f"LSTM dibatalkan untuk source ini."
+                        f"{interpolated_count}/{SEQUENCE_LENGTH} ({ratio:.0%}), "
+                        f"maks {MAX_INTERPOLATED_RATIO:.0%}. LSTM dibatalkan."
                     )
                     return None
-                logging.info(f"[{source}] Interpolasi OK: {interpolated_count} baris baru ({ratio:.0%})")
+                logging.info(
+                    f"[{source}] Interpolasi OK: "
+                    f"{interpolated_count} slot terisi ({ratio:.0%})"
+                )
+            else:
+                logging.info(f"[{source}] Resample selesai, tidak ada slot baru")
+            
+            df = df_grid
         else:
-            logging.info(f"[{source}] Data sudah rapi (interval 5 menit tepat)")
-        
-        # Ambil 144 data terakhir
-        if len(df) > SEQUENCE_LENGTH:
-            df = df.tail(SEQUENCE_LENGTH).reset_index(drop=True)
-        
-        if len(df) < SEQUENCE_LENGTH:
-            logging.warning(f"[{source}] Data kurang dari {SEQUENCE_LENGTH} setelah processing: {len(df)}")
-            return None
+            # Data sudah rapi — interval 5 menit sempurna, pakai langsung
+            df = df_144
+            logging.info(
+                f"[{source}] Data {SEQUENCE_LENGTH} point rapi "
+                f"(interval 5 menit sempurna, tanpa interpolasi)"
+            )
         
         logging.info(f"[{source}] Data final: {len(df)} rows")
         
         # Imputation untuk NaN yang tersisa
+        # Gunakan default klimatologis Indonesia, bukan 0, untuk menghindari
+        # outlier ekstrem pada scaler (misal suhu=0°C atau tekanan=0 hPa).
         numeric_cols = ['suhu', 'kelembaban', 'kecepatan_angin', 'arah_angin', 
                        'tekanan_udara', 'intensitas_hujan', 'intensitas_cahaya']
         for col in numeric_cols:
             if col in df.columns:
-                df[col] = df[col].ffill().bfill().fillna(0)
+                df[col] = df[col].ffill().bfill().fillna(_SAFE_FILL_DEFAULTS.get(col, 0))
         
         # Hitung time features (Sin/Cos)
         if 'timestamp' in df.columns:
@@ -726,10 +788,31 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         # Cek NaN
         if final_df.isnull().values.any():
             logging.warning(f"Data masih mengandung NaN setelah imputasi pada {source}")
-            final_df = final_df.ffill().bfill().fillna(0)
+            for col in final_df.columns:
+                if final_df[col].isnull().any():
+                    final_df[col] = final_df[col].ffill().bfill().fillna(_SAFE_FILL_DEFAULTS.get(col, 0))
         
-        # Ambil 144 ID terakhir untuk referensi
-        final_ids = row_ids[-SEQUENCE_LENGTH:] if len(row_ids) >= SEQUENCE_LENGTH else row_ids
+        # ── Map timestamp final → DB ID ──
+        # Grid slot dengan data asli → ID dari DB.
+        # Grid slot interpolasi → tidak ada DB ID (dilewati).
+        final_ids = []
+        for _ts in df['timestamp']:
+            _key = _ts.isoformat() if hasattr(_ts, 'isoformat') else str(_ts)
+            _db_id = _ts_to_id.get(_key)
+            if _db_id is not None:
+                final_ids.append(_db_id)
+        
+        if not final_ids:
+            # Fallback jika mapping gagal (misal timezone mismatch)
+            final_ids = row_ids[-SEQUENCE_LENGTH:] if len(row_ids) >= SEQUENCE_LENGTH else row_ids
+            logging.warning(f"[{source}] Timestamp→ID mapping gagal, menggunakan fallback IDs")
+        else:
+            interp_rows = SEQUENCE_LENGTH - len(final_ids)
+            if interp_rows > 0:
+                logging.info(
+                    f"[{source}] ID tracking: {len(final_ids)} DB rows + "
+                    f"{interp_rows} interpolated rows = {SEQUENCE_LENGTH} total"
+                )
         
         return (final_df, final_ids)
         
@@ -897,20 +980,42 @@ def _process_source(source: str, app) -> SourceResult:
             result.weather_id = weather.id
             logging.info(f"[{source}] Processing weather_id={weather.id}")
             
-            # 2. XGBoost prediction (FIRST)
-            try:
-                features = _prepare_xgboost_features(weather, source)
-                if features:
-                    result.xgboost = predict_xgboost(features, source)
-                    logging.info(f"[{source}] XGBoost: class {result.xgboost}")
-                else:
-                    result.xgboost_error = "Failed to prepare XGBoost features"
-                    logging.warning(f"[{source}] XGBoost: feature preparation failed")
-            except Exception as e:
-                result.xgboost_error = str(e)
-                logging.error(f"[{source}] XGBoost failed: {e}")
+            # 2. XGBoost freshness check — hindari prediksi dengan data basi
+            _xgb_ts = weather.date_utc if source == 'console' else weather.request_time
+            _data_is_fresh = False
+            if _xgb_ts is not None:
+                if _xgb_ts.tzinfo is None:
+                    _xgb_ts = _xgb_ts.replace(tzinfo=timezone.utc)
+                _age = (datetime.now(timezone.utc) - _xgb_ts).total_seconds()
+                _data_is_fresh = _age <= XGBOOST_FRESHNESS_SECONDS
+                if not _data_is_fresh:
+                    logging.warning(
+                        f"[{source}] XGBoost DILEWATI: data sudah {_age/60:.1f} menit lalu "
+                        f"(maks {XGBOOST_FRESHNESS_SECONDS//60} menit). "
+                        f"Menghindari prediksi dengan data basi."
+                    )
+                    result.xgboost_error = (
+                        f"Data basi ({_age/60:.0f} mnt, maks {XGBOOST_FRESHNESS_SECONDS//60} mnt)"
+                    )
+            else:
+                logging.warning(f"[{source}] Timestamp tidak tersedia, XGBoost dilewati")
+                result.xgboost_error = "Timestamp data tidak tersedia"
             
-            # 3. LSTM prediction (SECOND, regardless of XGBoost result)
+            # 3. XGBoost prediction (hanya jika data segar)
+            if _data_is_fresh:
+                try:
+                    features = _prepare_xgboost_features(weather, source)
+                    if features:
+                        result.xgboost = predict_xgboost(features, source)
+                        logging.info(f"[{source}] XGBoost: class {result.xgboost}")
+                    else:
+                        result.xgboost_error = "Failed to prepare XGBoost features"
+                        logging.warning(f"[{source}] XGBoost: feature preparation failed")
+                except Exception as e:
+                    result.xgboost_error = str(e)
+                    logging.error(f"[{source}] XGBoost failed: {e}")
+            
+            # 4. LSTM prediction (regardless of XGBoost result)
             try:
                 lstm_data = _fetch_lstm_data(source)
                 if lstm_data:

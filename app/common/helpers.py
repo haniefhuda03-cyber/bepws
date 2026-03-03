@@ -109,6 +109,67 @@ def inch_per_hour_to_mm_per_hour(inch_hr: Optional[float]) -> float:
         return 0.0
 
 
+def parse_flexible_date(value: str) -> Optional[datetime]:
+    """
+    Parse tanggal/datetime dari berbagai format umum.
+    
+    Format yang didukung:
+    - ISO 8601:       2026-02-01T00:00:00Z, 2026-02-01T07:00:00+07:00
+    - Date only:      2026-02-01, 2026/02/01
+    - Date reversed:  01-02-2026, 01/02/2026 (DD-MM-YYYY)
+    - Compact:        20260201
+    - With time:      2026-02-01 14:30:00, 2026-02-01 14:30
+    
+    Jika tidak ada timezone info, diasumsikan WIB (UTC+7) lalu dikonversi ke UTC.
+    
+    Returns:
+        datetime object in UTC, or None if parsing fails
+    """
+    if not value or not value.strip():
+        return None
+    
+    value = value.strip()
+    
+    # 1. Try ISO 8601 first (most standard)
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            # Naive → assume WIB input, convert to UTC
+            dt = dt.replace(tzinfo=WIB).astimezone(timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, AttributeError):
+        pass
+    
+    # 2. Try common formats
+    _FORMATS = [
+        # Date-only (assume start of day WIB)
+        ('%Y/%m/%d', True),
+        ('%d-%m-%Y', True),
+        ('%d/%m/%Y', True),
+        ('%Y%m%d', True),
+        # Date + time
+        ('%Y-%m-%d %H:%M:%S', True),
+        ('%Y-%m-%d %H:%M', True),
+        ('%Y/%m/%d %H:%M:%S', True),
+        ('%Y/%m/%d %H:%M', True),
+        ('%d-%m-%Y %H:%M:%S', True),
+        ('%d-%m-%Y %H:%M', True),
+        ('%d/%m/%Y %H:%M:%S', True),
+        ('%d/%m/%Y %H:%M', True),
+    ]
+    
+    for fmt, assume_wib in _FORMATS:
+        try:
+            dt = datetime.strptime(value, fmt)
+            if assume_wib:
+                dt = dt.replace(tzinfo=WIB).astimezone(timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    
+    return None
+
+
 def to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
     """
     Konversi datetime ke ISO string UTC.
@@ -124,5 +185,22 @@ def to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
+
+
+def to_wib_iso(dt: Optional[datetime]) -> Optional[str]:
+    """
+    Konversi datetime ke ISO string WIB (UTC+7).
+    
+    Args:
+        dt: Datetime object
+        
+    Returns:
+        ISO format string in WIB timezone, or None if dt is None
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(WIB).isoformat()
 
 

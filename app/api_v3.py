@@ -417,12 +417,14 @@ def strict_params(endpoint_name):
                         )
                 
                 elif schema['type'] == 'iso8601':
-                    try:
-                        datetime.fromisoformat(value.replace('Z', '+00:00'))
-                    except (ValueError, AttributeError):
+                    # Accept multiple date formats via flexible parser
+                    parsed = helpers.parse_flexible_date(value)
+                    if parsed is None:
                         return _error(
                             "INVALID_PARAMETER",
-                            f"'{param}' must be a valid ISO 8601 datetime (e.g. 2026-02-01T00:00:00Z)",
+                            f"'{param}' must be a valid datetime. "
+                            "Accepted: YYYY-MM-DD, DD-MM-YYYY, YYYY/MM/DD, "
+                            "YYYY-MM-DDTHH:MM:SSZ, YYYYMMDD",
                             400
                         )
             
@@ -793,9 +795,16 @@ def weather_history():
         - source: ecowitt|wunderground (default: ecowitt)
         - page: integer >= 1 (default: 1)
         - per_page: 1-10 (default: 5)
-        - start_date: ISO 8601 datetime, filter from (optional)
-        - end_date: ISO 8601 datetime, filter until (optional)
+        - start_date: Datetime filter (supports multiple formats, see below)
+        - end_date: Datetime filter (supports multiple formats, see below)
         - sort: 'newest' (DESC) or 'oldest' (ASC). Default: 'newest'
+    
+    Supported date formats:
+        - ISO 8601:     2026-02-01T00:00:00Z, 2026-02-01T07:00:00+07:00
+        - Date only:    2026-02-01, 2026/02/01 (WIB assumed)
+        - DD-MM-YYYY:   01-02-2026, 01/02/2026 (WIB assumed)
+        - Compact:      20260201 (WIB assumed)
+        - With time:    2026-02-01 14:30:00, 2026-02-01 14:30 (WIB assumed)
     """
     # Params
     source = request.args.get('source', 'ecowitt')
@@ -807,6 +816,22 @@ def weather_history():
     
     if (start_date and not end_date) or (end_date and not start_date):
         return _error("MISSING_PARAMETER", "start_date and end_date must be provided together")
+    
+    # Validate date formats using flexible parser
+    if start_date:
+        parsed_start = helpers.parse_flexible_date(start_date)
+        if parsed_start is None:
+            return _error("INVALID_PARAMETER",
+                f"Cannot parse 'start_date': '{start_date}'. "
+                "Accepted formats: YYYY-MM-DD, DD-MM-YYYY, YYYY/MM/DD, "
+                "YYYY-MM-DDTHH:MM:SSZ, YYYYMMDD")
+    if end_date:
+        parsed_end = helpers.parse_flexible_date(end_date)
+        if parsed_end is None:
+            return _error("INVALID_PARAMETER",
+                f"Cannot parse 'end_date': '{end_date}'. "
+                "Accepted formats: YYYY-MM-DD, DD-MM-YYYY, YYYY/MM/DD, "
+                "YYYY-MM-DDTHH:MM:SSZ, YYYYMMDD")
     
     # Use serializer
     payload = serializers.get_history_payload(

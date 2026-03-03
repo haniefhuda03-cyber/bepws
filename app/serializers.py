@@ -489,24 +489,19 @@ def get_history_payload(page: int = 1, start_date: Optional[str] = None, end_dat
     # Filters
     filters = []
     if start_date:
-        try:
-             # Support ISOZ or naive
-             dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-             if source == 'console':
-                 filters.append(models.WeatherLogConsole.date_utc >= dt)
-             else:
-                 filters.append(model_class.created_at >= dt)
-        except ValueError:
-             pass 
+        dt = helpers.parse_flexible_date(start_date)
+        if dt is not None:
+            if source == 'console':
+                filters.append(models.WeatherLogConsole.date_utc >= dt)
+            else:
+                filters.append(model_class.created_at >= dt)
     if end_date:
-        try:
-             dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-             if source == 'console':
-                 filters.append(models.WeatherLogConsole.date_utc <= dt)
-             else:
-                 filters.append(model_class.created_at <= dt)
-        except ValueError:
-             pass
+        dt = helpers.parse_flexible_date(end_date)
+        if dt is not None:
+            if source == 'console':
+                filters.append(models.WeatherLogConsole.date_utc <= dt)
+            else:
+                filters.append(model_class.created_at <= dt)
 
     # Count
     total = db.session.query(sa_func.count(model_class.id)).filter(*filters).scalar()
@@ -622,181 +617,6 @@ def get_source_current_payload(source: str) -> Dict[str, Any]:
     _pair_companion_lstm(pl, serialized, source)
     return {"ok": True, "data": serialized}
 
-def _deprecated_get_graph_payload(range_param: Optional[str], month: Optional[str] = None, source: Optional[str] = None, datatype: Optional[str] = None) -> Dict[str, Any]:
-    if not range_param:
-        return {"ok": False, "message": "Parameter 'range' required (weekly|monthly)"}
-    rp = range_param.lower()
-    if rp not in ("weekly", "monthly"):
-        return {"ok": False, "message": "range must be 'weekly' or 'monthly'"}
-
-    src = (source or 'ecowitt').lower()
-    if src not in ('ecowitt', 'wunderground'):
-        return {"ok": False, "message": "invalid source; gunakan 'ecowitt' atau 'wunderground'"}
-
-    if not datatype:
-        return {"ok": False, "message": "Parameter 'datatype' required"}
-    dt = datatype.lower()
-
-    mapping = {
-        'temperature': {'ecowitt': 'temperature_main_outdoor', 'wunderground': 'temperature'},
-        'relative_pressure': {'ecowitt': 'pressure_relative', 'wunderground': 'pressure'},
-        'humidity': {'ecowitt': 'humidity_outdoor', 'wunderground': 'humidity'},
-        'wind_speed': {'ecowitt': 'wind_speed', 'wunderground': 'wind_speed'},
-        'uvi': {'ecowitt': 'uvi', 'wunderground': 'ultraviolet_radiation'},
-        'rainfall': {'ecowitt': 'rain_rate', 'wunderground': 'precipitation_rate'},
-        'solar_radiation': {'ecowitt': 'solar_irradiance', 'wunderground': 'solar_radiation'},
-    }
-    
-    if dt not in mapping:
-        return {"ok": False, "message": f"unknown datatype '{dt}'"}
-
-    col_name = mapping[dt][src]
-
-    table = models.WeatherLogEcowitt if src == 'ecowitt' else models.WeatherLogWunderground
-
-    WIB = timezone(timedelta(hours=7))
-    now_utc = datetime.now(timezone.utc)
-    now_wib = now_utc.astimezone(WIB)
-    year_now = now_wib.year
-
-    if rp == 'weekly':
-        start_date = (now_wib.date() - timedelta(days=now_wib.weekday()))
-        end_date = start_date + timedelta(days=6)
-    else:
-        if month:
-            try:
-                month_i = int(month)
-            except Exception:
-                return {"ok": False, "message": "invalid month"}
-            if not (1 <= month_i <= 12):
-                return {"ok": False, "message": "month must be 1-12"}
-        else:
-            month_i = now_wib.month
-
-        _, last_day = calendar.monthrange(year_now, month_i)
-        start_date = datetime(year_now, month_i, 1, 0, 0, 0, tzinfo=WIB).date()
-        end_date = datetime(year_now, month_i, last_day, 23, 59, 59, tzinfo=WIB).date()
-
-    year_start = datetime(year_now, 1, 1, 0, 0, 0, tzinfo=WIB)
-    year_end = datetime(year_now, 12, 31, 23, 59, 59, tzinfo=WIB)
-
-    start_dt_wib = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=WIB)
-    end_dt_wib = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=WIB)
-    if start_dt_wib < year_start:
-        start_dt_wib = year_start
-    if end_dt_wib > year_end:
-        end_dt_wib = year_end
-
-    start_dt_utc = start_dt_wib.astimezone(timezone.utc)
-    end_dt_utc = end_dt_wib.astimezone(timezone.utc)
-
-    try:
-        col_attr = getattr(table, col_name)
-        
-        # Optimization: Use SQL Aggregation instead of fetching all rows
-        # Group by date(created_at). Note: This approximates UTC days.
-        # For strict WIB (UTC+7) grouping, dialect specific functions are needed.
-        # We use cast to Date which works across SQLite/Postgres generically.
-        from sqlalchemy import cast, Date
-        
-        date_group = cast(table.created_at, Date)
-        
-        rows = (
-            db.session.query(
-                date_group.label('day'), 
-                sa_func.avg(col_attr).label('avg_val')
-            )
-            .filter(table.created_at >= start_dt_utc, table.created_at <= end_dt_utc)
-            .group_by(date_group)
-            .all()
-        )
-        
-        # Convert aggregated results to dict {iso_date: value}
-        per_day = {}
-        for r in rows:
-            d_val = r[0]
-            val = r[1]
-            if d_val and val is not None:
-                if hasattr(d_val, 'isoformat'):
-                    key = d_val.isoformat()
-                else:
-                    key = str(d_val)
-                per_day[key] = float(val)
-
-    except Exception as e:
-        return {"ok": False, "message": f"database error: {e}"}
-
-    # Helper dates generator
-    dates = []
-    cur = start_dt_wib.date()
-    while cur <= end_dt_wib.date():
-        dates.append(cur)
-        cur = cur + timedelta(days=1)
-
-    day_name = {0: 'Senin', 1: 'Selasa', 2: 'Rabu', 3: 'Kamis', 4: 'Jumat', 5: 'Sabtu', 6: 'Minggu'}
-
-    data_out = []
-    idx = 1
-    y_values = []
-
-    for d in dates:
-        d_iso = d.isoformat()
-        if d > now_wib.date():
-            status = 'future'
-            y = None
-        elif d < now_wib.date():
-            # Past
-            if d_iso in per_day:
-                y = per_day[d_iso]
-                status = 'complete' 
-            else:
-                y = None
-                status = 'no_data'
-        else:
-            # Today
-            if d_iso in per_day:
-                y = per_day[d_iso]
-                status = 'partial'
-            else:
-                y = None
-                status = 'no_data'
-
-        if y is not None:
-            try:
-                y = float(round(y, 3))
-            except Exception:
-                pass
-            y_values.append(y)
-
-        data_out.append({
-            'id': idx,
-            'date': d_iso,
-            'x': day_name[d.weekday()],
-            'y': y,
-            'status': status,
-        })
-        idx += 1
-
-    if y_values:
-        summary = {'max': max(y_values), 'min': min(y_values), 'avg': float(round(sum(y_values) / len(y_values), 3))}
-    else:
-        summary = {'max': None, 'min': None, 'avg': None}
-
-    month_field = None
-    if rp == 'monthly':
-        month_field = int(month) if month else now_wib.month
-
-    resp = {
-        'ok': True,
-        'range': rp,
-        'datatype': dt,
-        'source': src,
-        'year': year_now,
-        'month': month_field,
-        'summary': summary,
-        'data': data_out,
-    }
-    return resp
 
 def get_latest_weather_data(source: str, load_fields: Optional[List[Any]] = None) -> Any:
     """
@@ -911,16 +731,10 @@ def get_graph_payload(range_param: Optional[str], month: Optional[str] = None, s
     end_dt_utc = end_dt_wib.astimezone(timezone.utc)
 
     # 1. Aggregation Query (Daily Avg)
-    is_sqlite = 'sqlite' in db.engine.dialect.name
-    
-    # Determine grouping expression based on dialect
-    if is_sqlite:
-         date_group = sa_func.date(table.created_at) 
-    else:
-         # Enterprise Grade Postgres: timezone-aware grouping
-         date_group = sa_func.date(
-             sa_func.timezone('Asia/Jakarta', sa_func.timezone('UTC', table.created_at))
-         )
+    # PostgreSQL: timezone-aware grouping for accurate WIB date boundaries
+    date_group = sa_func.date(
+        sa_func.timezone('Asia/Jakarta', sa_func.timezone('UTC', table.created_at))
+    )
 
     try:
         rows = (
@@ -1023,6 +837,7 @@ def get_graph_payload(range_param: Optional[str], month: Optional[str] = None, s
         'source': src,
         'year': year_i,
         'month': month_field,
+        'timezone': 'WIB (UTC+7)',
         'summary': summary,
         'data': data_out,
     }

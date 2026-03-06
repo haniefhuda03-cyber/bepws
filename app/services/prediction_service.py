@@ -95,6 +95,23 @@ LABEL_MAP = {
     8: 'Berpotensi Hujan dari Arah Barat Laut'
 }
 
+
+def get_rainfall_category(intensity_mm_per_hour: float) -> str:
+    """
+    Klasifikasi intensitas hujan (mm/jam) berdasarkan standar BMKG.
+    """
+    if intensity_mm_per_hour is None or intensity_mm_per_hour <= 0:
+        return 'Cerah'
+    elif intensity_mm_per_hour <= 1.0:
+        return 'Hujan Ringan'
+    elif intensity_mm_per_hour <= 5.0:
+        return 'Hujan Sedang'
+    elif intensity_mm_per_hour <= 10.0:
+        return 'Hujan Lebat'
+    # diatas 10 mm/jam
+    else:
+        return 'Hujan Sangat Lebat'
+
 XGBOOST_REQUIRED_FEATURES = [
     'suhu', 'kelembaban', 'kecepatan_angin', 
     'arah_angin', 'tekanan_udara', 'intensitas_hujan'

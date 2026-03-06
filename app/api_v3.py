@@ -35,7 +35,7 @@ from . import db, scheduler
 from . import models
 from . import serializers
 from .jobs import process_console_data
-from .services.prediction_service import LABEL_MAP
+from .services.prediction_service import LABEL_MAP, get_rainfall_category
 from .common import helpers
 
 # =====================================================================
@@ -662,13 +662,15 @@ def weather_predict():
         for i in range(min(limit, len(result_array))):
             hour_offset = i + 1
             target_dt_wib = base_hour_wib + timedelta(hours=hour_offset)
+            intensity = round(result_array[i], 3) if result_array[i] is not None else None
             predictions.append({
                 "id": i + 1,
                 "timestamp": timestamp_iso,
                 "time_target_predict": target_dt_wib.strftime("%H:%M"),
                 "date_target_predict": target_dt_wib.strftime("%d-%m-%y"),
                 "temp": None,
-                "weather_predict": round(result_array[i], 3) if result_array[i] is not None else None
+                "weather_predict": intensity,
+                "category": get_rainfall_category(intensity) if intensity is not None else None
             })
         data = predictions
 

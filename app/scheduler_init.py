@@ -4,26 +4,84 @@ from datetime import datetime, timedelta, timezone
 
 
 # =====================================================================
-# PREDICTION DEDUPLICATION GUARD
+# PREDICTION DEDUPLICATION GUARD (Redis + DB Fallback)
 # =====================================================================
-# Menyimpan timestamp terakhir prediksi berhasil dijalankan.
-# Digunakan oleh safety cron untuk menghindari prediksi ganda
-# jika event-driven trigger sudah berhasil pada jam yang sama.
+# Layer 1: Redis key "prediction_guard:{UTC_hour}" dengan TTL 3600s
+#          → Cepat, survive app restart selama Redis hidup
+# Layer 2: Query prediction_log (EXISTS, tanpa SELECT *)
+#          → Fallback jika Redis mati, source of truth dari DB
 # =====================================================================
-_last_prediction_hour: int = -1
+_GUARD_KEY_PREFIX = "prediction_guard"
+_GUARD_TTL_SECONDS = 3600  # 1 jam
+
+
+def _get_redis_for_guard():
+    """Ambil Redis client langsung (bypass cache.py memory fallback)."""
+    try:
+        from .cache import _get_redis_client
+        return _get_redis_client()
+    except Exception:
+        return None
 
 
 def _mark_prediction_done():
-    """Tandai bahwa prediksi sudah dijalankan pada jam ini."""
-    global _last_prediction_hour
+    """
+    Tandai bahwa prediksi sudah dijalankan pada jam ini.
+    Best-effort ke Redis — jika gagal, DB sudah merekam via prediction_log.
+    """
     now = datetime.now(timezone.utc)
-    _last_prediction_hour = now.hour
+    key = f"{_GUARD_KEY_PREFIX}:{now.hour}"
+
+    client = _get_redis_for_guard()
+    if client:
+        try:
+            client.setex(key, _GUARD_TTL_SECONDS, "1")
+            logging.debug(f"[GUARD] Redis SET {key} (TTL {_GUARD_TTL_SECONDS}s)")
+        except Exception as e:
+            logging.warning(f"[GUARD] Redis SET gagal (tidak masalah, DB sudah merekam): {e}")
 
 
 def _prediction_already_ran_this_hour() -> bool:
-    """Cek apakah prediksi sudah berjalan pada jam UTC saat ini."""
+    """
+    Cek apakah prediksi sudah berjalan pada jam UTC saat ini.
+    Layer 1: Redis (cepat) → Layer 2: DB prediction_log (fallback).
+    """
     now = datetime.now(timezone.utc)
-    return _last_prediction_hour == now.hour
+    key = f"{_GUARD_KEY_PREFIX}:{now.hour}"
+
+    # Layer 1: Redis
+    client = _get_redis_for_guard()
+    if client:
+        try:
+            if client.exists(key):
+                logging.debug(f"[GUARD] Redis HIT: {key}")
+                return True
+            logging.debug(f"[GUARD] Redis MISS: {key}")
+            return False
+        except Exception as e:
+            logging.warning(f"[GUARD] Redis cek gagal, fallback ke DB: {e}")
+
+    # Layer 2: DB — query ringan (EXISTS, tanpa load kolom)
+    try:
+        from . import db
+        from .models import PredictionLog
+
+        hour_start = now.replace(minute=0, second=0, microsecond=0)
+        exists = db.session.query(
+            db.session.query(PredictionLog.id)
+            .filter(PredictionLog.created_at >= hour_start)
+            .exists()
+        ).scalar()
+
+        if exists:
+            logging.info(f"[GUARD] DB fallback: prediksi DITEMUKAN pada jam {now.hour} UTC")
+        else:
+            logging.info(f"[GUARD] DB fallback: prediksi BELUM ADA pada jam {now.hour} UTC")
+        return exists
+    except Exception as e:
+        logging.error(f"[GUARD] DB fallback gagal: {e}")
+        # Jika Redis + DB gagal → return False (lebih baik jalan daripada skip)
+        return False
 
 
 def init_scheduler(app, scheduler, start=True):

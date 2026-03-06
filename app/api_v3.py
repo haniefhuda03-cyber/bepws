@@ -15,7 +15,7 @@ Endpoints:
 4. GET /weather/details - Detailed weather data
 5. GET /weather/history - Weather history (paginated)
 6. GET /weather/graph - Graph data
-7. POST/GET /weather/console - Console station data receiver (no auth)
+7. POST/GET /console - Console station data receiver (IP whitelist, port 5000)
 """
 
 import os
@@ -232,7 +232,7 @@ ENDPOINT_PARAMS = {
     'weather_details': ['source'],
     'weather_history': ['source', 'page', 'per_page', 'start_date', 'end_date', 'sort'],
     'weather_graph': ['range', 'datatype', 'source', 'month'],
-    'weather_console': []  # POST accepts form data
+    'console': []  # POST accepts form data
 }
 
 
@@ -953,7 +953,7 @@ def weather_graph():
 # 7. CONSOLE DATA ENDPOINT (POST/GET) - RESTful v3
 # =====================================================================
 
-@bp_v3.route('/weather/console', methods=['POST', 'GET'])
+@bp_v3.route('/console', methods=['POST', 'GET'])
 @rate_limit
 def weather_console():
     """
@@ -1005,33 +1005,20 @@ def weather_console():
         }), 400
     
     # =========================================================
-    # SECURITY CHECK (Mandatory — at least one method required)
+    # SECURITY CHECK — IP Whitelist Only
     # =========================================================
     
     whitelist_env = os.environ.get('CONSOLE_IP_WHITELIST')
-    console_key = os.environ.get('CONSOLE_KEY')
     
-    # Enterprise Policy: Tolak semua request jika tidak ada metode auth yang dikonfigurasi
-    if not whitelist_env and not console_key:
-        logging.error("[Console] SECURITY: No auth configured (CONSOLE_IP_WHITELIST & CONSOLE_KEY both unset). Rejecting.")
-        return _error("SERVER_CONFIG", "Console authentication not configured", 503)
+    if not whitelist_env:
+        logging.error("[Console] SECURITY: CONSOLE_IP_WHITELIST not configured. Rejecting.")
+        return _error("SERVER_CONFIG", "Console IP whitelist not configured", 503)
     
-    # 1. IP Whitelist (jika dikonfigurasi)
-    if whitelist_env:
-        allowed_ips = [ip.strip() for ip in whitelist_env.split(',') if ip.strip()]
-        client_ip = request.remote_addr
-        if client_ip not in allowed_ips:
-            logging.warning(f"[Console] Blocked IP: {client_ip}")
-            return _error("FORBIDDEN", "Station IP not allowed", 403)
-
-    # 2. Key Authentication (jika dikonfigurasi)
-    if console_key:
-        # Check header, form/query 'key', or 'PASSKEY' (common in weather stations)
-        req_key = request.headers.get('X-CONSOLE-KEY') or raw_data.get('key') or raw_data.get('PASSKEY') or raw_data.get('CONSOLE_KEY')
-        
-        if not req_key or not hmac.compare_digest(req_key, console_key):
-            logging.warning(f"[Console] Auth failed from {request.remote_addr}")
-            return _error("UNAUTHORIZED", "Invalid Console Key", 401)
+    allowed_ips = [ip.strip() for ip in whitelist_env.split(',') if ip.strip()]
+    client_ip = request.remote_addr
+    if client_ip not in allowed_ips:
+        logging.warning(f"[Console] Blocked IP: {client_ip}")
+        return _error("FORBIDDEN", "Station IP not allowed", 403)
     
     # =========================================================
     # FIELD VALIDATION
@@ -1130,7 +1117,7 @@ def weather_console():
         }), 400
     
     # Filter sensitive fields sebelum logging (PASSKEY, key, CONSOLE_KEY)
-    _SENSITIVE_FIELDS = {'PASSKEY', 'key', 'CONSOLE_KEY', 'passkey'}
+    _SENSITIVE_FIELDS = {'PASSKEY', 'key', 'passkey'}
     safe_data = {k: ('***' if k in _SENSITIVE_FIELDS else v) for k, v in raw_data.items()}
     logging.debug(f"[Console] Raw data: {safe_data}")
     

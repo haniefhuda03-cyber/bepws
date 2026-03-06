@@ -1,6 +1,8 @@
 import logging
 import logging.handlers
 import os
+import sys
+import io
 
 
 def configure_logging(app=None, level=logging.INFO):
@@ -11,7 +13,13 @@ def configure_logging(app=None, level=logging.INFO):
 
     logger.setLevel(level)
 
-    ch = logging.StreamHandler()
+    # Remove any pre-existing handlers (e.g. from implicit basicConfig)
+    for h in logger.handlers[:]:
+        logger.removeHandler(h)
+
+    # Console handler with UTF-8 support (prevents UnicodeEncodeError on Windows cp1252)
+    utf8_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    ch = logging.StreamHandler(stream=utf8_stream)
     ch.setLevel(level)
     formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s - %(message)s')
     ch.setFormatter(formatter)
@@ -21,7 +29,8 @@ def configure_logging(app=None, level=logging.INFO):
     try:
         os.makedirs(log_dir, exist_ok=True)
         fh = logging.handlers.RotatingFileHandler(
-            os.path.join(log_dir, 'app.log'), maxBytes=5 * 1024 * 1024, backupCount=3
+            os.path.join(log_dir, 'app.log'), maxBytes=5 * 1024 * 1024, backupCount=3,
+            encoding='utf-8'
         )
         fh.setLevel(level)
         fh.setFormatter(formatter)

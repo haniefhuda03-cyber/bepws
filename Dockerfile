@@ -15,7 +15,7 @@ RUN pip install -r requirements.txt
 ENV PYTHONUNBUFFERED=1
 COPY . .
 
-# Expose port
+# Expose port (5000 = API + Console endpoint)
 EXPOSE 5000
 
 # Jalankan dengan Gunicorn (2 workers, 4 threads, timeout 120 detik untuk ML load)

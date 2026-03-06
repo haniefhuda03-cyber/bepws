@@ -22,7 +22,7 @@
 
 ## Authentication
 
-All endpoints (except `/health` and `/weather/console`) require the `X-APP-KEY` header.
+All endpoints (except `/health` and `/console`) require the `X-APP-KEY` header.
 
 ```http
 X-APP-KEY: your-secret-key-here
@@ -489,12 +489,13 @@ Response graph menyertakan field `"timezone": "WIB (UTC+7)"` untuk menginformasi
 
 ### 7. Console Receiver
 
-**URL**: `POST /api/v3/weather/console`  
-**URL**: `GET /api/v3/weather/console` (for compatibility)  
-**Auth**: Optional (IP Whitelist & X-CONSOLE-KEY support)  
+**URL**: `POST /api/v3/console`  
+**URL**: `GET /api/v3/console` (for compatibility)  
+**Auth**: IP Whitelist only  
 **Rate Limited**: Yes
 
-Receive weather data from console station. Used by hardware devices.
+Receive weather data from console station (port 5000, same as Flask API). Used by hardware devices.
+Security: Only IPs listed in `CONSOLE_IP_WHITELIST` env var are allowed.
 
 #### Required Fields
 | Field | Type | Description |
@@ -520,7 +521,7 @@ Receive weather data from console station. Used by hardware devices.
 
 #### Example Request
 ```http
-POST /api/v3/weather/console
+POST /api/v3/console
 Content-Type: application/x-www-form-urlencoded
 
 tempf=80.5&humidity=75&winddir=135&baromrelin=29.92&windspeedmph=5.2
@@ -586,7 +587,7 @@ Semua GET endpoint (kecuali `/health`) menggunakan cache dual-layer:
 | `/weather/history` | `weather_history:{src}:{pg}:{pp}:{sd}:{ed}:{sort}` | 120 detik | `weather_log_*` (paginasi) |
 | `/weather/graph` | `weather_graph:{rng}:{src}:{dt}:{mo}:{yr}` | 300 detik | `weather_log_*` (aggregasi harian) |
 | `/health` | Tidak di-cache | - | Selalu real-time |
-| `/weather/console` | Tidak di-cache | - | Operasi tulis (POST) |
+| `/console` | Tidak di-cache | - | Operasi tulis (POST) |
 
 Jika cache HIT, database tidak diquery sama sekali. Jika cache MISS, data diquery dari database lalu disimpan ke cache.
 Jika cache error (Redis mati), endpoint tetap berfungsi normal dengan fallback ke in-memory cache.

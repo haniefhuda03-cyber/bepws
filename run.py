@@ -76,6 +76,7 @@ if __name__ == '__main__':
             logging.info("="*60)
 
     logging.info(f"[SERVER] Flask berjalan di http://{host}:{port}")
+    logging.info(f"[SERVER] Console endpoint (/api/v3/console) listen di port {port}")
     logging.info(f"[SERVER] Debug mode: {debug}")
     
     app.run(host=host, port=port, debug=debug, use_reloader=debug)

@@ -5,7 +5,7 @@ info:
     API cuaca publik untuk mendapatkan data cuaca real-time, prediksi, dan histori.
     
     ## Authentication
-    Semua endpoint (kecuali `/health` dan `/weather/console`) memerlukan header `X-APP-KEY`.
+    Semua endpoint (kecuali `/health` dan `/console`) memerlukan header `X-APP-KEY`.
     
     ## Rate Limiting
     - 100 request per menit per IP
@@ -935,14 +935,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
-  /weather/console:
+  /console:
     post:
       tags: [Console]
       summary: Terima data console (POST)
       description: |
         Endpoint untuk menerima data cuaca dari perangkat console station.
         
-        **Tidak memerlukan authentication** (untuk kompatibilitas device).
+        **Keamanan**: IP Whitelist only (env `CONSOLE_IP_WHITELIST`).
+        Console endpoint berjalan di port yang sama dengan Flask API (5000).
         
         Data disimpan dalam **Imperial units** sesuai format yang dikirim device.
       operationId: postConsoleData
@@ -1039,6 +1040,7 @@ paths:
         Alternatif GET method untuk menerima data console. Sama seperti POST.
         
         Beberapa weather station device mengirim data via GET query string.
+        **Keamanan**: IP Whitelist only (env `CONSOLE_IP_WHITELIST`).
       operationId: getConsoleData
       parameters:
         - name: tempf

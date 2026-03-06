@@ -1,4 +1,4 @@
-"""
+﻿"""
 Prediction Service dengan Layering Architecture
 ================================================
 Service layer untuk menangani prediksi cuaca menggunakan:
@@ -8,7 +8,7 @@ Service layer untuk menangani prediksi cuaca menggunakan:
 Fitur:
 - Singleton Model Loading: Model dimuat sekali saat aplikasi start
 - Smart Interpolation: Resampling data hanya jika ada data bolong
-- Parallel Pipeline: 3 sumber diproses paralel, XGBoost→LSTM sekuensial per sumber
+- Parallel Pipeline: 3 sumber diproses paralel, XGBoost->LSTM sekuensial per sumber
 - Partial Save: Simpan hasil yang berhasil (XGBoost/LSTM/keduanya)
 """
 
@@ -56,7 +56,7 @@ N_FEATURES = 9              # Jumlah fitur sesuai scaler
 RAIN_FEATURE_INDEX = 5      # Index kolom 'intensitas_hujan' pada scaler
 DATA_INTERVAL_MINUTES = 5   # Interval waktu antar data point
 MAX_INTERPOLATED_RATIO = 0.25  # Maks 25% data boleh hasil interpolasi
-XGBOOST_FRESHNESS_SECONDS = 5 * 60  # 5 menit — data XGBoost harus segar (maks 2 siklus fetch)
+XGBOOST_FRESHNESS_SECONDS = 5 * 60  # dibawah 5 menit — data XGBoost harus segar
 
 # Default values klimatologis Indonesia tropis untuk fallback fillna.
 # Digunakan HANYA jika ffill+bfill gagal (seluruh kolom NaN).
@@ -75,7 +75,7 @@ _SAFE_FILL_DEFAULTS = {
 _lstm_predict_lock = threading.Lock()
 
 # =====================================================================
-# UNIT CONVERSION (Imperial → Metric) untuk Console
+# UNIT CONVERSION (Imperial -> Metric) untuk Console
 # Hanya digunakan saat prediksi, TIDAK mengubah data di database
 # =====================================================================
 
@@ -428,12 +428,12 @@ def _prepare_xgboost_features(weather_log, source: str) -> Optional[Dict[str, fl
             raw_rain = float(weather_log.rain_rate) if weather_log.rain_rate is not None else 0.0
             
             features = {
-                'suhu': helpers.fahrenheit_to_celsius(raw_temp),  # °F → °C
+                'suhu': helpers.fahrenheit_to_celsius(raw_temp),  # °F -> °C
                 'kelembaban': float(weather_log.humidity) if weather_log.humidity is not None else None,
-                'kecepatan_angin': helpers.mph_to_ms(raw_wind),  # mph → m/s
+                'kecepatan_angin': helpers.mph_to_ms(raw_wind),  # mph -> m/s
                 'arah_angin': float(weather_log.wind_direction) if weather_log.wind_direction is not None else None,
-                'tekanan_udara': helpers.inch_hg_to_hpa(raw_pressure),  # inHg → hPa
-                'intensitas_hujan': helpers.inch_per_hour_to_mm_per_hour(raw_rain) if raw_rain else 0.0,  # in/hr → mm/hr
+                'tekanan_udara': helpers.inch_hg_to_hpa(raw_pressure),  # inHg -> hPa
+                'intensitas_hujan': helpers.inch_per_hour_to_mm_per_hour(raw_rain) if raw_rain else 0.0,  # in/hr -> mm/hr
             }
         elif source == 'ecowitt':
             # Ecowitt - kolom: temperature_main_outdoor, humidity_outdoor
@@ -485,11 +485,11 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
     1. Query data dari database (154 rows buffer)
     2. Normalisasi timestamp ke kelipatan 5 menit
     3. Deduplikasi (rata-rata untuk timestamp kembar)
-    4. Cek: data unik ≥ 144? Jika tidak → ABORT
+    4. Cek: data unik ≥ 144? Jika tidak -> ABORT
     5. Ambil 144 data terbaru
-    6. Jika interval sudah rapi (semua 5 menit) → pakai langsung
+    6. Jika interval sudah rapi (semua 5 menit) -> pakai langsung
     7. Jika ada gap (loncat 10, 15 menit dst):
-       - Buat grid 5-menit dari min→max timestamp
+       - Buat grid 5-menit dari min->max timestamp
        - Interpolasi ringan (maks 6 slot berturut-turut = 30 menit)
        - Ambil tail(144), cek rasio interpolasi ≤ 25%
     8. Hitung time features (hour_sin, hour_cos)
@@ -565,11 +565,11 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         # Reverse agar urut dari lama ke baru
         rows = list(reversed(rows))
         
-        # Build mapping: normalized_timestamp → DB ID.
+        # Build mapping: normalized_timestamp -> DB ID.
         # Digunakan setelah grid mapping untuk tracking ID yang akurat.
         # Slot interpolasi tidak punya DB ID, hanya slot dengan data asli.
         row_ids = [row.id for row in rows]
-        _ts_to_id: Dict[str, int] = {}  # isoformat string → DB row ID
+        _ts_to_id: Dict[str, int] = {}  # isoformat string -> DB row ID
         for row in rows:
             _ts_raw = row.date_utc if source == 'console' else row.request_time
             if _ts_raw is not None:
@@ -606,13 +606,13 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
                 
                 data_list.append({
                     'timestamp': ts_normalized,
-                    'suhu': helpers.fahrenheit_to_celsius(raw_temp) if not np.isnan(raw_temp) else np.nan,  # °F → °C
+                    'suhu': helpers.fahrenheit_to_celsius(raw_temp) if not np.isnan(raw_temp) else np.nan,  # °F -> °C
                     'kelembaban': float(row.humidity) if row.humidity is not None else np.nan,
-                    'kecepatan_angin': helpers.mph_to_ms(raw_wind),  # mph → m/s
+                    'kecepatan_angin': helpers.mph_to_ms(raw_wind),  # mph -> m/s
                     'arah_angin': float(row.wind_direction) if row.wind_direction is not None else 0.0,
-                    'tekanan_udara': helpers.inch_hg_to_hpa(raw_pressure) if not np.isnan(raw_pressure) else np.nan,  # inHg → hPa
-                    'intensitas_hujan': helpers.inch_per_hour_to_mm_per_hour(raw_rain) if raw_rain else 0.0,  # in/hr → mm/hr
-                    'intensitas_cahaya': helpers.wm2_to_lux(raw_solar),  # W/m² → lux
+                    'tekanan_udara': helpers.inch_hg_to_hpa(raw_pressure) if not np.isnan(raw_pressure) else np.nan,  # inHg -> hPa
+                    'intensitas_hujan': helpers.inch_per_hour_to_mm_per_hour(raw_rain) if raw_rain else 0.0,  # in/hr -> mm/hr
+                    'intensitas_cahaya': helpers.wm2_to_lux(raw_solar),  # W/m² -> lux
                 })
             elif source == 'wunderground':
                 # Wunderground - kolom: temperature, humidity, pressure, precipitation_rate
@@ -658,7 +658,7 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         dup_count = len(df) - len(df_deduped)
         if dup_count > 0:
             logging.info(
-                f"[{source}] {dup_count} duplikat digabung → "
+                f"[{source}] {dup_count} duplikat digabung -> "
                 f"{len(df_deduped)} timestamp unik"
             )
         
@@ -668,7 +668,7 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         if len(df_deduped) < SEQUENCE_LENGTH:
             logging.warning(
                 f"[{source}] Data asli tidak cukup untuk LSTM: "
-                f"{len(df_deduped)}/{SEQUENCE_LENGTH} (butuh ≥{SEQUENCE_LENGTH} data unik). "
+                f"{len(df_deduped)}/{SEQUENCE_LENGTH} (butuh >={SEQUENCE_LENGTH} data unik). "
                 f"Tunggu data terkumpul."
             )
             return None
@@ -679,7 +679,7 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         logging.info(
             f"[{source}] {len(df_deduped)} data unik tersedia, "
             f"ambil {SEQUENCE_LENGTH} terbaru: "
-            f"{df_144['timestamp'].min()} → {df_144['timestamp'].max()}"
+            f"{df_144['timestamp'].min()} -> {df_144['timestamp'].max()}"
         )
         
         # ── STEP 4: Cek apakah interval sudah rapi (semua 5 menit) ──
@@ -688,16 +688,16 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         
         if needs_resample:
             # Ada gap (loncat 10, 15, ... menit) — perlu resample + interpolasi
-            # Bangun grid 5-menit dari min→max, interpolasi gap ringan.
+            # Bangun grid 5-menit dari min->max, interpolasi gap ringan.
             logging.info(
                 f"[{source}] Ada gap dalam {SEQUENCE_LENGTH} data "
-                f"→ resample + interpolasi ringan"
+                f"-> resample + interpolasi ringan"
             )
             
             # Simpan set timestamp asli untuk tracking rasio interpolasi
             original_ts_set = set(df_144['timestamp'].apply(lambda x: x.isoformat()))
             
-            # Buat grid 5-menit dari min→max timestamp
+            # Buat grid 5-menit dari min->max timestamp
             ts_min = df_144['timestamp'].min()
             ts_max = df_144['timestamp'].max()
             grid = pd.date_range(start=ts_min, end=ts_max, freq=f'{DATA_INTERVAL_MINUTES}min')
@@ -792,9 +792,9 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
                 if final_df[col].isnull().any():
                     final_df[col] = final_df[col].ffill().bfill().fillna(_SAFE_FILL_DEFAULTS.get(col, 0))
         
-        # ── Map timestamp final → DB ID ──
-        # Grid slot dengan data asli → ID dari DB.
-        # Grid slot interpolasi → tidak ada DB ID (dilewati).
+        # ── Map timestamp final -> DB ID ──
+        # Grid slot dengan data asli -> ID dari DB.
+        # Grid slot interpolasi -> tidak ada DB ID (dilewati).
         final_ids = []
         for _ts in df['timestamp']:
             _key = _ts.isoformat() if hasattr(_ts, 'isoformat') else str(_ts)
@@ -805,7 +805,7 @@ def _fetch_lstm_data(source: str) -> Optional[Tuple[pd.DataFrame, List[int]]]:
         if not final_ids:
             # Fallback jika mapping gagal (misal timezone mismatch)
             final_ids = row_ids[-SEQUENCE_LENGTH:] if len(row_ids) >= SEQUENCE_LENGTH else row_ids
-            logging.warning(f"[{source}] Timestamp→ID mapping gagal, menggunakan fallback IDs")
+            logging.warning(f"[{source}] Timestamp->ID mapping gagal, menggunakan fallback IDs")
         else:
             interp_rows = SEQUENCE_LENGTH - len(final_ids)
             if interp_rows > 0:
@@ -955,7 +955,7 @@ def predict_lstm(data: pd.DataFrame, source: str) -> Optional[List[float]]:
 
 def _process_source(source: str, app) -> SourceResult:
     """
-    Process single source: XGBoost → LSTM (sequential within thread).
+    Process single source: XGBoost -> LSTM (sequential within thread).
     Dijalankan dalam thread terpisah (parallel antar sumber).
     
     Args:
@@ -987,7 +987,7 @@ def _process_source(source: str, app) -> SourceResult:
                 if _xgb_ts.tzinfo is None:
                     _xgb_ts = _xgb_ts.replace(tzinfo=timezone.utc)
                 _age = (datetime.now(timezone.utc) - _xgb_ts).total_seconds()
-                _data_is_fresh = _age <= XGBOOST_FRESHNESS_SECONDS
+                _data_is_fresh = _age < XGBOOST_FRESHNESS_SECONDS
                 if not _data_is_fresh:
                     logging.warning(
                         f"[{source}] XGBoost DILEWATI: data sudah {_age/60:.1f} menit lalu "
@@ -1053,7 +1053,7 @@ def run_prediction_pipeline(skip_sources: list = None) -> Optional[PredictionLog
     
     Features:
     - Parallel: sumber diproses bersamaan
-    - Sequential: XGBoost → LSTM dalam tiap thread
+    - Sequential: XGBoost -> LSTM dalam tiap thread
     - Partial Save: Simpan XGBoost jika berhasil, simpan LSTM jika berhasil
     - Error Isolation: Error satu sumber tidak mempengaruhi lainnya
     - Timeout: 60 detik per sumber

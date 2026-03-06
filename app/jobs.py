@@ -493,16 +493,27 @@ def fetch_and_store_weather():
             executor.submit(_fetch_with_context, fetch_wunderground, app, 'Wunderground'): 'Wunderground',
         }
         
-        for future in as_completed(futures, timeout=PARALLEL_TIMEOUT):
-            try:
-                source_name, result, error = future.result()
-                results[source_name] = result
-                if error:
-                    logging.warning(f"[FETCH] {source_name}: {error}")
-            except Exception as e:
-                source_name = futures[future]
-                logging.error(f"[FETCH] {source_name} exception: {e}")
-                results[source_name] = None
+        try:
+            for future in as_completed(futures, timeout=PARALLEL_TIMEOUT):
+                try:
+                    source_name, result, error = future.result()
+                    results[source_name] = result
+                    if error:
+                        logging.warning(f"[FETCH] {source_name}: {error}")
+                except Exception as e:
+                    source_name = futures[future]
+                    logging.error(f"[FETCH] {source_name} exception: {e}")
+                    results[source_name] = None
+        except TimeoutError:
+            # as_completed() timeout — beberapa fetch belum selesai (retry masih jalan)
+            for future, source_name in futures.items():
+                if source_name not in results:
+                    logging.error(
+                        f"[FETCH] {source_name} TIMEOUT setelah {PARALLEL_TIMEOUT}s "
+                        f"(retry mungkin masih berjalan). Ditandai gagal."
+                    )
+                    results[source_name] = None
+                    future.cancel()
     
     # Log hasil
     success_count = sum(1 for r in results.values() if r is not None)

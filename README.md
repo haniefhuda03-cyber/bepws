@@ -192,8 +192,7 @@ RATE_LIMIT_WINDOW=60
 # CONSOLE STATION (opsional)
 # ============================================================
 CONSOLE_ENDPOINT_ENABLED=true
-CONSOLE_KEY="your-console-secret-key"
-CONSOLE_IP_WHITELIST="192.168.1.100,10.0.0.50"
+CONSOLE_IP_WHITELIST="192.168.4.1"
 ```
 
 ### Step 6: Jalankan Migrasi Database
@@ -261,7 +260,7 @@ Fitur:
 ## 📡 API v3 Endpoints
 
 **Base URL**: `/api/v3`  
-**Authentication**: Header `X-APP-KEY` (kecuali `/health` dan `/weather/console`)  
+**Authentication**: Header `X-APP-KEY` (kecuali `/health` dan `/console`)  
 **Rate Limit**: 100 requests per 60 detik
 
 | Method | Endpoint | Auth | Deskripsi |
@@ -272,7 +271,7 @@ Fitur:
 | GET | `/api/v3/weather/details` | Ya | Detail cuaca (UVI, solar, tekanan) |
 | GET | `/api/v3/weather/history` | Ya | Histori cuaca (pagination + filter) |
 | GET | `/api/v3/weather/graph` | Ya | Data grafik (agregasi harian) |
-| POST/GET | `/api/v3/weather/console` | Console Key | Terima data console station |
+| POST/GET | `/api/v3/console` | IP Whitelist | Terima data console station (port 5000) |
 
 ### Query Parameters
 
@@ -504,7 +503,7 @@ Cache dual-layer: **Redis** (primary) + **in-memory dict** (fallback otomatis ji
 | `/weather/history` | `weather_history:{src}:{pg}:{pp}:{sd}:{ed}:{sort}` | 120s |
 | `/weather/graph` | `weather_graph:{rng}:{src}:{dt}:{mo}` | 300s |
 | `/health` | Tidak di-cache | — |
-| `/weather/console` | Tidak di-cache | — |
+| `/console` | Tidak di-cache | — |
 
 - Cache **HIT** → database TIDAK diquery
 - Cache **MISS** → query DB → simpan ke cache
@@ -619,8 +618,7 @@ tuwsbe-fix/
 | `RATE_LIMIT_REQUESTS` | Max requests per window | `100` |
 | `RATE_LIMIT_WINDOW` | Window duration (detik) | `60` |
 | `CONSOLE_ENDPOINT_ENABLED` | Aktifkan console endpoint | `true` |
-| `CONSOLE_KEY` | Secret key untuk console auth | *(wajib untuk console)* |
-| `CONSOLE_IP_WHITELIST` | IP whitelist (comma-separated) | *(opsional)* |
+| `CONSOLE_IP_WHITELIST` | IP whitelist (comma-separated) | *(wajib untuk console)* |
 | `ECO_APP_KEY` | Ecowitt application key | *(opsional)* |
 | `ECO_API_KEY` | Ecowitt API key | *(opsional)* |
 | `ECO_MAC` | Ecowitt device MAC | *(opsional)* |

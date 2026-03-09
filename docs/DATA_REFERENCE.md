@@ -193,3 +193,29 @@ Data disimpan langsung ke database tanpa konversi unit.
 | **Pressure** | hPa | hPa | inHg |
 | **Rain** | mm | mm | in |
 | **VPD** | - | inHg | kPa |
+
+---
+
+## Computed Fields (Tidak Disimpan di Database)
+
+Beberapa field dihitung saat API response dan **tidak** disimpan di database:
+
+| Field | Endpoint | Fungsi | Keterangan |
+|-------|----------|--------|------------|
+| `compass` | `/weather/current` | `deg_to_compass()` | Konversi derajat angin ke arah mata angin (N, NE, E, dst.) |
+| `weather_condition` | `/weather/current` | `classify_weather_condition()` | Klasifikasi kondisi cuaca dari multi-sensor |
+
+### Weather Condition Classification
+
+`weather_condition` diklasifikasikan menggunakan 4 parameter sensor:
+- **rain_rate** (mm/hr) — prioritas utama
+- **humidity** (%)
+- **solar illumination** (lux)
+- **wind_speed** (m/s)
+
+Untuk source **Console** (imperial), unit dikonversi ke metric sebelum klasifikasi:
+- `in/hr` → `mm/hr` (curah hujan)
+- `mph` → `m/s` (kecepatan angin)
+- `W/m²` → `lux` (solar radiation)
+
+Untuk source **Wunderground**, solar radiation (`W/m²`) dikonversi ke `lux` menggunakan `wm2_to_lux()`.

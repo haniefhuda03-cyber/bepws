@@ -90,7 +90,11 @@ def _get_redis_client():
         _redis_client.ping()  # Fail fast check
         _redis_available = True
         _last_redis_failure = 0.0  # Reset cooldown
-        logging.info(f"[CACHE] Connected to Redis at {redis_url}")
+        # Mask credentials in log output
+        from urllib.parse import urlparse
+        parsed = urlparse(redis_url)
+        safe_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 6379}/{parsed.path.lstrip('/')}"
+        logging.info(f"[CACHE] Connected to Redis at {safe_url}")
         return _redis_client
     except ImportError:
         logging.warning("[CACHE] 'redis' library not installed. Using memory cache.")

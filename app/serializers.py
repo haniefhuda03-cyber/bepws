@@ -283,6 +283,8 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
             models.WeatherLogEcowitt.rain_rate,
             models.WeatherLogEcowitt.wind_speed,
             models.WeatherLogEcowitt.wind_direction,
+            models.WeatherLogEcowitt.solar_irradiance,
+            models.WeatherLogEcowitt.uvi,
         ]
         wl = get_latest_weather_data('ecowitt', load_fields)
         if wl:
@@ -298,6 +300,12 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
                 "wind_speed": wl.wind_speed,
                 "wind_degree": wl.wind_direction,
                 "compass": helpers.deg_to_compass(wl.wind_direction),
+                "weather_condition": helpers.classify_weather_condition(
+                    rain_rate_mm=wl.rain_rate,
+                    humidity=wl.humidity_outdoor,
+                    solar_lux=wl.solar_irradiance,
+                    wind_speed_ms=wl.wind_speed,
+                ),
             }
 
     elif target_source == 'wunderground':
@@ -310,6 +318,7 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
             models.WeatherLogWunderground.precipitation_rate,
             models.WeatherLogWunderground.wind_speed,
             models.WeatherLogWunderground.wind_direction,
+            models.WeatherLogWunderground.solar_radiation,
         ]
         wl = get_latest_weather_data('wunderground', load_fields)
         if wl:
@@ -325,6 +334,12 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
                 "wind_speed": wl.wind_speed,
                 "wind_degree": wl.wind_direction,
                 "compass": helpers.deg_to_compass(wl.wind_direction),
+                "weather_condition": helpers.classify_weather_condition(
+                    rain_rate_mm=wl.precipitation_rate,
+                    humidity=wl.humidity,
+                    solar_lux=helpers.wm2_to_lux(wl.solar_radiation),
+                    wind_speed_ms=wl.wind_speed,
+                ),
             }
             
     else: # Console
@@ -337,6 +352,7 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
              models.WeatherLogConsole.rain_rate,
              models.WeatherLogConsole.wind_speed,
              models.WeatherLogConsole.wind_direction,
+             models.WeatherLogConsole.solar_radiation,
          ]
          wl = get_latest_weather_data('console', load_fields)
          if wl:
@@ -351,6 +367,12 @@ def get_current_payload(source: Optional[str] = None) -> Dict[str, Any]:
                  "wind_speed": wl.wind_speed,
                  "wind_degree": wl.wind_direction,
                  "compass": helpers.deg_to_compass(wl.wind_direction),
+                 "weather_condition": helpers.classify_weather_condition(
+                     rain_rate_mm=helpers.inch_per_hour_to_mm_per_hour(wl.rain_rate),
+                     humidity=wl.humidity,
+                     solar_lux=helpers.wm2_to_lux(wl.solar_radiation),
+                     wind_speed_ms=helpers.mph_to_ms(wl.wind_speed),
+                 ),
              }
 
     if not data:

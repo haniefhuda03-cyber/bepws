@@ -266,7 +266,7 @@ Fitur:
 | Method | Endpoint | Auth | Deskripsi |
 |--------|----------|------|-----------|
 | GET | `/api/v3/health` | Tidak | Health check sistem |
-| GET | `/api/v3/weather/current` | Ya | Data cuaca terkini |
+| GET | `/api/v3/weather/current` | Ya | Data cuaca terkini + kondisi cuaca |
 | GET | `/api/v3/weather/predict` | Ya | Prediksi ML (LSTM/XGBoost) |
 | GET | `/api/v3/weather/details` | Ya | Detail cuaca (UVI, solar, tekanan) |
 | GET | `/api/v3/weather/history` | Ya | Histori cuaca (pagination + filter) |
@@ -288,6 +288,23 @@ Fitur:
 | `range` | graph | `weekly` \| `monthly` (**wajib**) |
 | `datatype` | graph | `temperature` \| `humidity` \| `rainfall` \| `wind_speed` \| `uvi` \| `solar_radiation` \| `relative_pressure` (**wajib**) |
 | `month` | graph | `1-12` (wajib untuk `range=monthly`. **Banned untuk weekly**) |
+
+### Fitur Weather Condition (Current Weather)
+
+Endpoint `/weather/current` menyertakan field `weather_condition` yang diklasifikasikan otomatis dari multi-sensor (curah hujan, kelembaban, intensitas cahaya, kecepatan angin).
+
+| Kondisi | Kriteria |
+|---------|----------|
+| Hujan Sangat Lebat | Curah hujan > 10 mm/jam |
+| Hujan Lebat | Curah hujan > 5 mm/jam |
+| Hujan Sedang | Curah hujan > 1 mm/jam |
+| Hujan Ringan | Curah hujan > 0 mm/jam |
+| Cerah | Tidak hujan, lux >= 30000 |
+| Cerah Berawan | Tidak hujan, lux >= 10000 & humidity >= 80%, atau lux >= 3000 & humidity < 85% |
+| Berawan | Tidak hujan, lux >= 3000 & humidity >= 85%, atau lux < 3000 & humidity >= 80% |
+| Mendung | Tidak hujan, lux < 3000 & humidity >= 90% |
+
+> Untuk source `console`, unit imperial (in/hr, mph, W/m²) dikonversi ke metric secara internal sebelum klasifikasi. Untuk source `wunderground`, solar radiation (W/m²) dikonversi ke lux.
 
 ### Response Format
 ```json
@@ -586,7 +603,7 @@ tuwsbe-fix/
 │   ├── jobs.py                  # Scheduler jobs (fetch, predict)
 │   ├── cache.py                 # Redis + in-memory fallback cache
 │   ├── common/
-│   │   └── helpers.py           # Konversi unit, timezone, utilities
+│   │   └── helpers.py           # Konversi unit, timezone, weather classification
 │   └── services/
 │       └── prediction_service.py  # ML prediction pipeline
 ├── ml_models/                   # Trained ML models (.keras, .joblib)
@@ -647,13 +664,14 @@ tuwsbe-fix/
 
 Konversi unit **hanya terjadi di pipeline prediksi internal**, bukan di response API.
 
-| Konversi | Fungsi | Contoh |
+| Konversi / Fungsi | Fungsi | Contoh |
 |----------|--------|--------|
 | °F → °C | `fahrenheit_to_celsius()` | 100°F → 37.78°C |
 | inHg → hPa | `inch_hg_to_hpa()` | 29.92 → 1013.21 |
 | mph → m/s | `mph_to_ms()` | 10 → 4.47 |
 | in/hr → mm/hr | `inch_per_hour_to_mm_per_hour()` | 0.33 → 8.38 |
 | W/m² → lux | `wm2_to_lux()` | 100 → 12670 |
+| Multi-sensor → Kondisi | `classify_weather_condition()` | rain=0, hum=70, lux=35000 → "Cerah" |
 
 ### Satuan Data per Source di Database
 
@@ -665,4 +683,8 @@ Konversi unit **hanya terjadi di pipeline prediksi internal**, bukan di response
 | Rain | mm/hr | mm/hr | in/hr |
 | Solar | lux | W/m² | W/m² |
 
-> Response API mengembalikan data **apa adanya** dari database tanpa konversi. Hanya pipeline prediksi yang melakukan konversi internal.
+> Response API mengembalikan data **apa adanya** dari database tanpa konversi, kecuali:
+> - `compass`: Derajat angin dikonversi ke arah kompas (`deg_to_compass()`).
+> - `weather_condition` (endpoint `/weather/current`): Klasifikasi multi-sensor. Untuk source Console, unit imperial dikonversi ke metric secara internal sebelum klasifikasi.
+> 
+> Selain itu, hanya pipeline prediksi yang melakukan konversi internal.

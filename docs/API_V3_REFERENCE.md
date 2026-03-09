@@ -208,10 +208,28 @@ X-APP-KEY: your-key
     "precip_rate": 0.0,
     "wind_speed": 5.2,
     "wind_degree": 135,
-    "compass": "SE"
+    "compass": "SE",
+    "weather_condition": "Cerah Berawan"
   }
 }
 ```
+
+#### Weather Condition Categories
+
+Field `weather_condition` diklasifikasikan otomatis dari multi-sensor (curah hujan, kelembaban, intensitas cahaya matahari, kecepatan angin).
+
+| Kondisi | Kriteria |
+|---------|----------|
+| Hujan Sangat Lebat | Curah hujan > 10 mm/jam (standar BMKG) |
+| Hujan Lebat | Curah hujan > 5 mm/jam |
+| Hujan Sedang | Curah hujan > 1 mm/jam |
+| Hujan Ringan | Curah hujan > 0 mm/jam |
+| Cerah | Tidak hujan, lux >= 30000 |
+| Cerah Berawan | Tidak hujan, lux >= 10000 & humidity >= 80%, atau lux >= 3000 & humidity < 85% |
+| Berawan | Tidak hujan, lux >= 3000 & humidity >= 85%, atau lux < 3000 & humidity >= 80% |
+| Mendung | Tidak hujan, lux < 3000 & humidity >= 90% |
+
+> **Catatan Unit:** Untuk source `console`, unit imperial (in/hr, mph, W/m²) dikonversi ke metric secara internal sebelum klasifikasi. Untuk source `wunderground`, solar radiation (W/m²) dikonversi ke lux sebelum klasifikasi.
 
 ---
 
@@ -248,11 +266,24 @@ GET /api/v3/weather/predict?source=ecowitt&model=lstm&limit=6
       "time_target_predict": "11:00",
       "date_target_predict": "05-02-26",
       "temp": null,
-      "weather_predict": 0.125
+      "weather_predict": 0.125,
+      "category": "Hujan Ringan"
     },
     ...
   ]
 }
+```
+
+#### LSTM Rainfall Category (Standar BMKG)
+| Intensitas (mm/jam) | Kategori |
+|---------------------|---------------------|
+| ≤ 0 | Cerah |
+| 0.01 – 1.0 | Hujan Ringan |
+| 1.01 – 5.0 | Hujan Sedang |
+| 5.01 – 10.0 | Hujan Lebat |
+| > 10.0 | Hujan Sangat Lebat |
+
+> `weather_predict` dibulatkan 3 angka di belakang koma. `category` berisi label klasifikasi berdasarkan nilai intensitas.
 ```
 
 #### Example: XGBoost Prediction
@@ -604,7 +635,9 @@ Jika cache error (Redis mati), endpoint tetap berfungsi normal dengan fallback k
 
 **Saat API response:**
 - Tidak ada konversi unit. Data dikembalikan apa adanya dari database.
-- Satu-satunya transformasi: `deg_to_compass()` mengubah derajat angin ke nama arah (N, NE, E, dst.) di endpoint `/weather/current`.
+- Transformasi yang dilakukan:
+  - `deg_to_compass()` mengubah derajat angin ke nama arah (N, NE, E, dst.) di endpoint `/weather/current`.
+  - `classify_weather_condition()` mengklasifikasikan kondisi cuaca dari multi-sensor di endpoint `/weather/current`. Untuk source Console (imperial), unit dikonversi ke metric sebelum klasifikasi. Untuk Wunderground, solar radiation (W/m²) dikonversi ke lux.
 - Semua timestamp diformat ke ISO 8601 UTC menggunakan `to_utc_iso()`.
 
 **Saat prediksi ML (pipeline internal, bukan API):**
@@ -617,8 +650,9 @@ Data Console dikonversi ke satuan metrik sebelum dimasukkan ke model:
 | mph ke m/s | `mph_to_ms()` | 10 mph menjadi 4.47 m/s |
 | in/hr ke mm/hr | `inch_per_hour_to_mm_per_hour()` | 0.33 in/hr menjadi 8.38 mm/hr |
 | W/m2 ke lux | `wm2_to_lux()` | 100 W/m2 menjadi 12670 lux |
+| Multi-sensor ke kondisi | `classify_weather_condition()` | rain=0, hum=70, lux=35000 menjadi "Cerah" |
 
-Konversi ini hanya terjadi di pipeline prediksi internal, bukan di response API.
+Konversi `classify_weather_condition()` digunakan di endpoint `/weather/current` untuk menghasilkan field `weather_condition`. Konversi lainnya hanya terjadi di pipeline prediksi internal, bukan di response API.
 
 ### Ringkasan Satuan per Sumber Data
 

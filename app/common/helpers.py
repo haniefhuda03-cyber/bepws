@@ -109,6 +109,59 @@ def inch_per_hour_to_mm_per_hour(inch_hr: Optional[float]) -> float:
         return 0.0
 
 
+def classify_weather_condition(
+    rain_rate_mm: Optional[float],
+    humidity: Optional[float],
+    solar_lux: Optional[float],
+    wind_speed_ms: Optional[float] = None,
+) -> str:
+    """
+    Klasifikasi kondisi cuaca saat ini berdasarkan multi-parameter sensor.
+
+    Args:
+        rain_rate_mm: Intensitas hujan dalam mm/hr (sudah dikonversi ke metric).
+        humidity: Kelembaban udara (%).
+        solar_lux: Intensitas cahaya matahari dalam lux.
+        wind_speed_ms: Kecepatan angin dalam m/s (opsional).
+
+    Returns:
+        String kategori kondisi cuaca.
+    """
+    rr = safe_float(rain_rate_mm, 0.0)
+    hum = safe_float(humidity, 0.0)
+    lux = safe_float(solar_lux, 0.0)
+    ws = safe_float(wind_speed_ms, 0.0)
+
+    # 1. Prioritas: jika ada hujan, klasifikasi berdasarkan intensitas (BMKG)
+    if rr > 10.0:
+        return 'Hujan Sangat Lebat'
+    if rr > 5.0:
+        return 'Hujan Lebat'
+    if rr > 1.0:
+        return 'Hujan Sedang'
+    if rr > 0.0:
+        return 'Hujan Ringan'
+
+    # 2. Tidak hujan — klasifikasi berdasarkan cahaya & kelembaban
+    if lux >= 30000:
+        return 'Cerah'
+    if lux >= 10000:
+        if hum >= 80:
+            return 'Cerah Berawan'
+        return 'Cerah'
+    if lux >= 3000:
+        if hum >= 85:
+            return 'Berawan'
+        return 'Cerah Berawan'
+
+    # lux < 3000 (mendung / malam)
+    if hum >= 90:
+        return 'Mendung'
+    if hum >= 80:
+        return 'Berawan'
+    return 'Cerah Berawan'
+
+
 def parse_flexible_date(value: str) -> Optional[datetime]:
     """
     Parse tanggal/datetime dari berbagai format umum.

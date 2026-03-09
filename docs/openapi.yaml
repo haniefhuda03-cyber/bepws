@@ -192,6 +192,22 @@ components:
           type: string
           description: Arah angin dalam kompas
           example: NW
+        weather_condition:
+          type: string
+          description: |
+            Klasifikasi kondisi cuaca berdasarkan multi-sensor
+            (curah hujan, kelembaban, solar, angin).
+            Dihitung otomatis saat response, tidak disimpan di database.
+          enum:
+            - Cerah
+            - Cerah Berawan
+            - Berawan
+            - Mendung
+            - Hujan Ringan
+            - Hujan Sedang
+            - Hujan Lebat
+            - Hujan Sangat Lebat
+          example: Cerah Berawan
 
     PredictionXGBoost:
       type: object
@@ -252,8 +268,19 @@ components:
           example: 29.1
         weather_predict:
           type: number
-          description: Intensitas hujan prediksi (mm/jam)
+          description: Intensitas hujan prediksi (mm/jam), dibulatkan 3 desimal
           example: 0.125
+        category:
+          type: string
+          nullable: true
+          description: |
+            Kategori intensitas hujan berdasarkan standar BMKG:
+            - Cerah (≤ 0 mm/jam)
+            - Hujan Ringan (0.01–1.0 mm/jam)
+            - Hujan Sedang (1.01–5.0 mm/jam)
+            - Hujan Lebat (5.01–10.0 mm/jam)
+            - Hujan Sangat Lebat (> 10.0 mm/jam)
+          example: "Hujan Ringan"
 
     DetailsData:
       type: object
@@ -521,6 +548,7 @@ paths:
         - `wind_speed` — Kecepatan angin (m/s)
         - `wind_degree` — Arah angin (derajat)
         - `compass` — Arah angin (kompas: N, NE, E, SE, S, SW, W, NW)
+        - `weather_condition` — Kondisi cuaca (Cerah, Cerah Berawan, Berawan, Mendung, Hujan Ringan, Hujan Sedang, Hujan Lebat, Hujan Sangat Lebat)
         - `dew_point` — Titik embun (°C)
       operationId: getCurrentWeather
       security:
@@ -557,6 +585,7 @@ paths:
                   wind_speed: 1.0
                   wind_degree: 313.0
                   compass: NW
+                  weather_condition: Cerah Berawan
         '401':
           description: X-APP-KEY tidak ada atau tidak valid
           content:
@@ -653,18 +682,20 @@ paths:
                       source: ecowitt
                       timestamp: "2026-02-24T03:00:00.000000+00:00"
                     data:
-                      - id: 101
+                      - id: 1
                         timestamp: "2026-02-24T03:00:00.000000+00:00"
                         time_target_predict: "11:00"
                         date_target_predict: "24-02-26"
-                        temp: 29.1
+                        temp: null
                         weather_predict: 0.125
-                      - id: 102
+                        category: "Hujan Ringan"
+                      - id: 2
                         timestamp: "2026-02-24T03:00:00.000000+00:00"
                         time_target_predict: "12:00"
                         date_target_predict: "24-02-26"
-                        temp: 30.5
-                        weather_predict: 0.342
+                        temp: null
+                        weather_predict: 5.342
+                        category: "Hujan Lebat"
               schema:
                 type: object
                 properties:
